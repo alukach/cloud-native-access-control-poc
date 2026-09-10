@@ -52,15 +52,24 @@ pub enum RegionKind {
     /// `region.kind = 'metadata'` allow plus a catch-all classification is a
     /// wildcard. Unrecognized bytes are [`RegionKind::Unmapped`], not
     /// `Metadata`.
-    Metadata { name: String },
+    Metadata {
+        name: String,
+    },
     /// Bytes belonging to nothing known. No policy can match this: its props
     /// carry no column, no coordinates, no name -- nothing to write a rule
     /// against. Under a conjunctive decision that makes any range touching
     /// unclassified bytes a denial, which is the entire point.
     Unmapped,
-    ColumnChunk { column: String, row_group: usize },
-    ColumnIndex { column: String },
-    BloomFilter { column: String },
+    ColumnChunk {
+        column: String,
+        row_group: usize,
+    },
+    ColumnIndex {
+        column: String,
+    },
+    BloomFilter {
+        column: String,
+    },
     Tile {
         overview_level: u32,
         x: u32,
@@ -290,7 +299,7 @@ impl LayoutIndex {
             }
             if let RegionKind::Tile { bbox, .. } = &r.kind {
                 if !bbox.iter().all(|c| c.is_finite()) {
-                    return Err(IndexError::NonFiniteBbox(*bbox));
+                    return Err(IndexError::NonFiniteBbox { start: r.start });
                 }
             }
             if r.start < cursor {
@@ -528,7 +537,10 @@ mod tests {
     fn regions_past_the_end_of_the_object_are_rejected() {
         assert_eq!(
             LayoutIndex::try_new(vec![chunk(95, 10, "a")], 100).unwrap_err(),
-            IndexError::PastEof { end: 105, size: 100 }
+            IndexError::PastEof {
+                end: 105,
+                size: 100
+            }
         );
         // Nothing fits in a zero-byte object.
         assert!(LayoutIndex::try_new(vec![chunk(0, 1, "a")], 0).is_err());
@@ -598,7 +610,10 @@ mod tests {
         assert_eq!(idx.resolve(&(50..200)).len(), 1); // says nothing about 100..200
         assert_eq!(
             idx.try_resolve(&(50..200)).unwrap_err(),
-            ResolveError::PastEof { end: 200, size: 100 }
+            ResolveError::PastEof {
+                end: 200,
+                size: 100
+            }
         );
         assert_eq!(idx.try_resolve(&(50..100)).unwrap().len(), 1);
     }
@@ -631,8 +646,12 @@ mod tests {
                 column: "ssn".into(),
                 row_group: 3,
             },
-            RegionKind::ColumnIndex { column: "ssn".into() },
-            RegionKind::BloomFilter { column: "ssn".into() },
+            RegionKind::ColumnIndex {
+                column: "ssn".into(),
+            },
+            RegionKind::BloomFilter {
+                column: "ssn".into(),
+            },
             RegionKind::Tile {
                 overview_level: 2,
                 x: 1,
@@ -672,7 +691,7 @@ mod tests {
         ] {
             assert_eq!(
                 LayoutIndex::try_new(vec![tile(bad)], 100).unwrap_err(),
-                IndexError::NonFiniteBbox(bad)
+                IndexError::NonFiniteBbox { start: 0 }
             );
             let props = tile(bad).props();
             assert!(props.get("geom").is_none(), "emitted geom for {bad:?}");
@@ -691,7 +710,10 @@ mod tests {
         let inverted = tile([10.0, 20.0, 0.0, 0.0]).props();
         assert_eq!(upright["geom"], inverted["geom"]);
         assert_eq!(upright["bbox"], json!({"bbox":[0.0,0.0,10.0,20.0]}));
-        let ring = upright["geom"]["coordinates"][0].as_array().unwrap().clone();
+        let ring = upright["geom"]["coordinates"][0]
+            .as_array()
+            .unwrap()
+            .clone();
         assert_eq!(ring.len(), 5, "ring must repeat its first point");
         assert_eq!(ring[0], ring[4]);
         assert_eq!(
