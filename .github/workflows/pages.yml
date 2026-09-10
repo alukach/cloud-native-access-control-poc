@@ -1,0 +1,100 @@
+name: Deploy demo to Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a running deploy; queue behind it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+
+      - name: Build wasm
+        run: wasm-pack build --release --target web --out-dir web/pkg
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp -r web/. _site/
+          # Sample files land here once Task 8 generates them. They must be
+          # served uncompressed with byte ranges or Live mode cannot work.
+          if [ -d data ]; then cp -r data _site/data; fi
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  # Pages applies Range AFTER gzip, so a ranged request against a compressed
+  # type returns a slice of the COMPRESSED stream with a Content-Range against
+  # the compressed length. Browsers always send Accept-Encoding: gzip and it is
+  # a Fetch-forbidden header, so this cannot be worked around from JS.
+  # Pages does not compress octet-stream, tiff or wasm today -- but that is one
+  # MIME-database change away from silently breaking Live mode, so assert it.
+  verify-hosting:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert range support and no compression on binary assets
+        env:
+          URL: ${{ needs.deploy.outputs.page_url || format('https://{0}.github.io/{1}/', github.repository_owner, github.event.repository.name) }}
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            local path="$1"
+            local url="${URL%/}/$path"
+            local code
+            code=$(curl -sS -o /dev/null -w '%{http_code}' "$url" || echo 000)
+            if [ "$code" != "200" ]; then
+              echo "skip $path (HTTP $code, not published yet)"
+              return 0
+            fi
+            echo "checking $path"
+            local hdrs
+            hdrs=$(curl -sSI "$url")
+            grep -qi '^accept-ranges: bytes' <<<"$hdrs" \
+              || { echo "  FAIL: no accept-ranges: bytes"; fail=1; }
+            if grep -qi '^content-encoding:' <<<"$hdrs"; then
+              echo "  FAIL: served compressed; ranges would slice the compressed stream"
+              fail=1
+            fi
+            local rcode
+            rcode=$(curl -sS -o /dev/null -w '%{http_code}' -H 'Range: bytes=0-19' "$url")
+            [ "$rcode" = "206" ] \
+              || { echo "  FAIL: Range request returned $rcode, expected 206"; fail=1; }
+          }
+          check "pkg/cnac_bg.wasm"
+          for f in data/*; do
+            [ -e "$f" ] && check "$f"
+          done
+          exit $fail

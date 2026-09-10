@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the exact compiler and installs the
+      # wasm32 target. The pin is load-bearing: bundle size is a recorded
+      # finding and moves across compiler releases from codegen alone.
+      - run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test (debug)
+        run: cargo test
+
+      # The Range parser had an integer overflow that panicked in debug and
+      # silently wrapped in release. Both profiles get run for that reason.
+      - name: Test (release)
+        run: cargo test --release
+
+      - name: Build for wasm32
+        run: cargo build --release --target wasm32-unknown-unknown
