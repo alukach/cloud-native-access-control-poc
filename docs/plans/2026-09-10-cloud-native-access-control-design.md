@@ -16,20 +16,33 @@ tile it lands in. Everything here follows from recovering that meaning.
 
 ## What this proof of concept must decide
 
-Whether `multistore` should adopt sub-object access control. That turns on one
-measurement, stated before we run it:
+Whether `multistore` should adopt sub-object access control. That turns on
+whether real readers issue boundary-aligned ranges. **Measurement of the two
+readers we care about is already done, and the answer is conditional:**
 
-> Under a realistic column-mask policy, run a real query with a real reader.
-> Count ranges issued, ranges that straddle a policy boundary, and whether the
-> query completes.
+| Reader | Default behavior | Aligned behavior |
+| --- | --- | --- |
+| hyparquet | Coalesces column chunks into runs up to a 2 MB `runLimit` — with ~1 MB row groups, all 19 columns merge into **one** fetch | Passing `columns: [...]` yields **one exact fetch per column chunk**, `[min(dict,data)_page_offset, +total_compressed_size)` |
+| geotiff.js | `fromUrl` defaults `blockSize: 65536`, so reads are 64 KB-block-aligned, not tile-aligned — one block spans ~9 tiles at 7 KB/tile | `blockSize: undefined` disables blocking |
 
-**Adopt** if straddling is rare enough that ordinary queries succeed, or if
-readers can be nudged (via projection pushdown or read-coalescing limits) into
-boundary-aligned reads. **Do not adopt** if ordinary queries routinely fail,
-because then the feature is unusable regardless of how elegant the policy
-language is.
+So **column-level masking is not pointless, but it is conditional on the reader
+projecting columns.** Without projection pushdown, a full-table scan coalesces
+across the very boundary the policy draws and every request straddles.
 
-Everything else in this document is in service of producing that number.
+That reframes the deliverable. The question is no longer "does coalescing
+break this" — it does, by default, in both readers. It is:
+
+> Given that aligned reads are achievable in both readers by configuration,
+> what does a gateway do about clients it does not control?
+
+The demo answers it by making both modes a toggle and showing the counters
+side by side: ranges issued, ranges straddling a boundary, query outcome.
+
+**Adopt** if aligned mode is reachable for the clients that matter (DuckDB,
+pyarrow, GDAL all push projection down) and the gateway can detect and reject
+unaligned reads with a comprehensible error. **Do not adopt** if the common
+path is a coalesced scan that cannot be nudged, because then the feature only
+ever returns 403.
 
 ## Non-goals
 
@@ -328,28 +341,89 @@ nothing else we do to bundle size will show. Do not reuse the published
 
 Static, on GitHub Pages, WASM over the same crate.
 
-Interception happens at hyparquet's `AsyncBuffer` and geotiff.js's source, not
-a `fetch` shim — those are the libraries' own range-fetch seams.
+**GitHub Pages serves ranges correctly** — verified against a live `*.github.io`
+asset: `accept-ranges: bytes`, `206` for `bytes=0-19`, suffix `bytes=-20` (the
+Parquet footer pattern), and open-ended `bytes=100-`; `416` past EOF.
+Multi-range returns `200` with the full file, which is harmless since
+geotiff.js defaults `maxRanges = 0`.
+
+Two hosting traps, both measured:
+
+- **Pages applies Range *after* gzip.** On a compressed type, a ranged request
+  returns a slice of the *compressed* stream with a `content-range` against the
+  compressed length. Browsers always send `Accept-Encoding: gzip` and that
+  header is Fetch-forbidden, so this is unfixable from JS. It does not fire for
+  us — `application/octet-stream` (`.parquet`), `image/tiff` and
+  `application/wasm` are not compressed by Pages — but it is one MIME-database
+  change from silently breaking. **CI asserts the sample files come back with
+  no `content-encoding`.**
+- **Git LFS does not work on Pages.** It serves the pointer text. Commit the
+  binaries directly.
+
+Interception is at each library's own range seam, not a `fetch` shim:
+
+```js
+// hyparquet: supply an AsyncBuffer
+{ byteLength: size, async slice(start, end) { /* end exclusive */ } }
+
+// geotiff.js: subclass BaseSource, pass to GeoTIFF.fromSource
+class PolicySource extends BaseSource {
+  async fetch(slices, signal) {}   // slices: [{offset, length}]
+  get fileSize() {}
+}
+```
+
+Denials propagate cleanly in both. hyparquet rejects the `parquetRead` promise;
+geotiff.js's source throws on a non-ok response, and `allowFullFile` defaults
+`false` so even a 200 throws rather than silently accepting a full file. No
+hangs, no silent garbage.
+
+Two configuration traps that will otherwise eat a day:
+
+- hyparquet's footer read defaults to a **512 KB tail**. On an 8 MB file that
+  straddles the last row group's chunks, so the demo's own bootstrap read trips
+  the coalescing rule and nothing ever loads. Pass `initialFetchSize` ~8 KB.
+- geotiff.js documents `blockSize: null` to disable blocking, but
+  `maybeWrapInBlockedSource` tests `=== undefined`, so `null` yields NaN block
+  math. Use `blockSize: undefined`.
+
+The UI:
 
 - Parquet renders as a row-group × column grid, COG as a tile grid per overview
   level. CSS grid, not canvas.
-- Spatial policy uses two or three **preset AOI polygons** that paste a
-  `POLYGON(...)` into the policy textarea. Real `S_INTERSECTS` over `geo`, real
-  tiles going dark, for a string constant each. Click-to-draw is ~150 lines of
-  screen→pixel→geo transform and is not the finding.
-- The heatmap is a second colorway on the same grid — hit counts instead of
-  allow/deny — fed by the log live mode already emits. No separate replay mode,
-  no log file format: a recorded log cannot surface coalescing anyway, because
-  coalescing is a behavior of the live reader.
-- Denying `region.kind = 'metadata'` is permitted, and breaks everything. That
-  teaches the constraint better than a paragraph.
-- **A visible counter for ranges issued, ranges straddling a boundary, and
-  query outcome.** This is the deliverable.
+- Spatial policy uses two or three **preset AOI polygons** pasted into the
+  policy textarea. Real `S_INTERSECTS` over `geo`, real tiles going dark, for a
+  string constant each. Click-to-draw is ~150 lines of screen→pixel→geo
+  transform and is not the finding.
+- **An alignment toggle** — projection on/off for Parquet, blocking on/off for
+  COG — with the counters visible in both positions. This is the deliverable.
+- The heatmap is a second colorway on the same grid, fed by the log live mode
+  already emits. No separate replay mode and no log format: a recorded log
+  cannot surface coalescing, because coalescing is a behavior of the live
+  reader.
+- Denying `region.kind = 'metadata'` is permitted, and breaks everything.
 
-Sample files must be large enough for coalescing to bite — multi-row-group,
-multi-column-chunk Parquet, and a tiled COG with real overviews. A file small
-enough to be fetched in one range measures zero straddles and reports a false
-negative. Tens of MB is fine; Pages caps files at 100 MB.
+### Sample files
+
+Sized so coalescing bites in default mode. Both are demonstrable in both modes.
+
+| file | size | structure |
+| --- | --- | --- |
+| `nyc-taxi-8rg.parquet` | 8.4 MB | 8 row groups × 19 columns = 152 chunks, 630 B – 275 KB each; ~1.05 MB per row group, under the 2 MB `runLimit`, so a default read collapses each row group to one fetch |
+| `s2-tci-512.tif` | 4.7 MB | 6 overview levels, 484/121/36/9/4/1 tiles at 512 px; ~7 KB per tile, so one 64 KB block spans ~9 tiles |
+
+```sh
+# Parquet - ROW_GROUP_SIZE is mandatory; the 1M-row default yields ONE row group.
+# SNAPPY, not ZSTD: hyparquet handles uncompressed and snappy natively.
+duckdb -c "COPY (SELECT * FROM read_parquet('yellow_tripdata_2024-01.parquet') LIMIT 400000)
+  TO 'nyc-taxi-8rg.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 50000);"
+
+gdal_translate TCI.tif s2-tci-512.tif -of COG \
+  -co BLOCKSIZE=512 -co COMPRESS=JPEG -co QUALITY=75 -co OVERVIEWS=IGNORE_EXISTING
+```
+
+Sources: NYC TLC yellow taxi trip data, Sentinel-2 L2A TCI. ~13 MB committed,
+against a 1 GB Pages limit and a 100 MB per-file limit.
 
 ## Testing
 
@@ -362,6 +436,8 @@ negative. Tens of MB is fine; Pages caps files at 100 MB.
   zero-length, past-EOF, and absent-Range requests.
 - **Fail closed**: a policy referencing an undeclared property is rejected *at
   load*; `Err` from `matches` denies.
+- **Hosting regression**: CI asserts the sample files are served by Pages with
+  `accept-ranges: bytes` and no `content-encoding`.
 
 ## What this does not do
 
