@@ -1,251 +1,405 @@
 # Sub-object access control for cloud-native formats
 
 **Date:** 2026-09-10
-**Status:** Approved design, not yet implemented
+**Status:** Design, revised after review. Not yet implemented.
 
 ## Problem
 
 Cloud-native formats — Parquet, COG, Zarr, Icechunk — are read by HTTP range
-requests against object storage. Access control today is all-or-nothing: a
-principal may read the object or may not. We want finer grain. An analyst
-should read every column but `salary`. A licensee should read full-resolution
-imagery inside their AOI and overviews everywhere else.
+requests against object storage. Access control today is all-or-nothing. We
+want finer grain: an analyst who reads every column but `salary`, a licensee
+who reads full-resolution imagery inside their AOI and overviews everywhere
+else.
 
 A range request is opaque. `bytes=1234-5678` carries no hint of which column or
-which tile it lands in. Everything here follows from recovering that meaning.
+tile it lands in. Everything here follows from recovering that meaning.
 
-## Goals
+## What this proof of concept must decide
 
-1. Determine whether a principal may read a given byte range of a given object,
-   using rules written in a concise, expressive language.
-2. Reuse the same machinery in reverse: given a log of past range requests,
-   report which columns, tiles, or areas were read most.
-3. Ship a static web UI on GitHub Pages that demonstrates both against real
-   files, so the approach can be evaluated before `multistore` changes.
+Whether `multistore` should adopt sub-object access control. That turns on one
+measurement, stated before we run it:
+
+> Under a realistic column-mask policy, run a real query with a real reader.
+> Count ranges issued, ranges that straddle a policy boundary, and whether the
+> query completes.
+
+**Adopt** if straddling is rare enough that ordinary queries succeed, or if
+readers can be nudged (via projection pushdown or read-coalescing limits) into
+boundary-aligned reads. **Do not adopt** if ordinary queries routinely fail,
+because then the feature is unusable regardless of how elegant the policy
+language is.
+
+Everything else in this document is in service of producing that number.
 
 ## Non-goals
 
-- No `multistore` integration. This project produces a crate and a demo; wiring
-  it into the gateway is separate work informed by what we learn here.
+- No `multistore` integration.
 - No identity or authentication. The principal is a mocked JSON object.
-- No writes. Read paths only.
+- No writes.
 - No hiding that data exists. See "What this does not do".
 
 ## Mechanism
 
 Two stages, strictly separated.
 
-**Resolve** maps a byte range to logical regions. Each format keeps a metadata
-block that describes its own byte layout; parsing it yields a `LayoutIndex`
-that is built once per object and cached.
+**Resolve** maps a byte range to logical regions, using a `LayoutIndex` built
+once per object from its footer.
 
-**Decide** evaluates a policy against each overlapped region. Default deny.
+**Decide** evaluates the policy against every overlapped region.
 
-### Format coverage
+### Decision semantics
 
-| Format | Range to meaning | Notes |
-| --- | --- | --- |
-| Parquet | Footer `FileMetaData` gives each column chunk's offset and length | Exact, cheap |
-| COG | IFD `TileOffsets` / `TileByteCounts` per overview level; bbox from `ModelTiepoint` and `ModelPixelScale` | Exact; index can be large |
-| Zarr | Chunk is its own object; the key (`precip/0.3.2`) carries the coordinates | No byte parsing at all |
-| Zarr v3 sharded | Shard index at the end of the shard object | Mechanically like Parquet |
-| Icechunk | Manifests hold `(object, offset, length)` chunk references | Needs a manifest read first |
+These four rules are the security core. They were all unstated in the first
+draft and each one is a bypass when guessed wrong.
 
-Parquet and COG ship first. They are the two genuinely different shapes:
-columnar masking and spatial masking. Zarr and Icechunk follow within this
-project's life.
+1. **Conjunctive.** *Every* overlapped region must satisfy the policy. The
+   decision is `all`, not `any`, short-circuiting on the first denial.
+   Under `any`, `bytes=<footer start>-<salary chunk end>` matches the metadata
+   rule and serves the salary column.
+2. **Total coverage.** Regions partition `[0, object_size)` with no holes.
+   Bytes belonging to nothing get an explicit `{"kind":"unmapped"}` region that
+   no policy can match. Without this, `all` over an empty set returns `true`
+   and any unmapped range is authorized — Parquet's `PAR1` magic, inter-chunk
+   padding, page index and bloom filter pages, or a *striped* GeoTIFF where
+   `TileOffsets` is absent and therefore nothing at all maps.
+3. **Absent Range means the whole object.** Normalize a missing header,
+   `bytes=0-`, and `bytes=-N` to an explicit range and decide it like any
+   other. A reader that gets 403 on a coalesced range commonly retries as a
+   full-object GET, walking straight into this.
+4. **Half-open internally, inclusive on the wire.** HTTP `bytes=a-b` includes
+   `b`; `Region { start, len }` does not. Canonicalize at the boundary. Getting
+   this wrong makes `bytes=<salary_start - 1>-<salary_start>` read one
+   protected byte per request without ever tripping a denial.
 
-Because Zarr's region identity lives in the object key rather than in bytes,
-`resolve` accepts the key alongside the range from the start. That one decision
-makes Zarr close to free later.
+### The API returns ranges, not a verdict
 
-### Request flow
+```rust
+fn check(index: &LayoutIndex, policy: &Policy, ctx: &Value, req: &RangeRequest)
+    -> Decision;
 
-On a cache miss the gateway must read the object's footer before it can
-authorize anything:
-
+enum Decision {
+    Authorized { canonical: Vec<Range<u64>> },
+    Denied { reason: DenyReason },
+}
 ```
-GET /path/file.parquet   Range: bytes=1234-5678
-  -> no LayoutIndex cached for this object
-  -> gateway issues its own backend reads: HEAD for size, GET last ~64KB
-  -> parse footer -> LayoutIndex -> cache
-  -> resolve(key, 1234-5678) -> [Region]
-  -> decide(policy, {user, region}) -> allow | deny
-```
 
-`ObjectId { endpoint, bucket, key }` is load-bearing three times: fetching the
-footer, keying the index cache, and selecting which policy applies. It is not a
-variable inside a filter — by evaluation time the data's shape is known and the
-policy was already chosen for this dataset.
+The caller **must fetch exactly `canonical`, must not forward the client's
+original `Range` header, and must reject any backend response whose
+`Content-Range` differs.**
 
-Policies should key on the **gateway-facing path**, not the resolved backend
-endpoint. `multistore` exists to make backend migrations invisible; binding
-policy to physical location would make a migration silently change who can read
-what.
+This matters because the gateway's Range parser and the backend's need not
+agree, and RFC 9110 says an origin that does not understand a Range header
+*must ignore it and return 200 with the entire representation*. So
+`bytes=0-0, items=100-200` can be allowed by a lenient parser and answered
+with the whole object. Same class: `If-Range` with a stale validator, and
+multi-range requests answered as `multipart/byteranges`. Never forwarding the
+client's header closes all of them at once, and is backend-independent.
+
+`Denied` must not carry the resolved regions off-box — a 403 that echoes them
+hands back the protected column's name and byte extent.
 
 ### Types
 
 ```rust
-struct ObjectId { endpoint: String, bucket: String, key: String }
-
-struct Region { start: u64, len: u64, props: Value }
-// parquet: {"kind":"column_chunk", "column":"salary", "row_group":3}
-// cog:     {"kind":"tile", "overview_level":0, "x":12, "y":5, "bbox":[..]}
-// either:  {"kind":"metadata"}
-
-trait RangeFetcher {
-    async fn get(&self, id: &ObjectId, r: Range<u64>) -> Result<Bytes>;
-}
+struct Region { start: u64, len: u64, kind: RegionKind, props: Value }
 ```
 
-`RangeFetcher` has two real implementations from the first day — `fetch()` in
-the browser, the existing backend client in the gateway — which is why the
-interface exists at all.
+`build_index(footer: &[u8], object_size: u64, format: Format) -> LayoutIndex`
+is **synchronous and pure**. There is no `RangeFetcher` trait: the caller
+fetches. In the browser that caller is hyparquet's `AsyncBuffer` or
+geotiff.js's source, which are already range-fetchers written in the language
+that owns the network. An async trait across the WASM boundary would buy an
+`async-trait` dependency, a `Send`/`?Send` split, and an error type spanning
+`JsValue` and `io::Error`, for one implementation.
 
-### Index representation
+Regions are a sorted `Vec`, binary-searched. `props` JSON is built inside the
+hit loop, so non-overlapping regions never materialize any.
 
-A large COG carries one `TileOffsets` entry per tile per overview level;
-100,000 regions is ordinary. The index therefore stores the raw numeric arrays
-and **synthesizes `props` JSON lazily**, only for regions a request actually
-overlaps. Memory stays flat and CQL2 evaluates over three objects rather than
-a hundred thousand.
+## Format resolvers
 
-Lookup is binary search over a sorted `Vec`. An interval tree buys nothing at
-this scale.
+Parquet and COG ship first: columnar masking and spatial masking are the two
+genuinely different shapes. `resolve` takes the object key as well as the
+range, which is what makes Zarr nearly free later.
 
-### Cache validity
+### Parquet
 
-An index is valid only while the object is byte-identical. Key the cache on
-ETag and invalidate when it changes. Free for immutable data, required for
-anything versioned.
+- **Never use `ColumnChunk.file_offset`.** It is deprecated in
+  `parquet.thrift`, which records that implementations disagreed about whether
+  it points at the `ColumnMetaData` or the first page, and that "in many cases
+  the `ColumnMetaData` at this location is wrong."
+- Extent is `min(dictionary_page_offset, data_page_offset)` through
+  `+ total_compressed_size`. Starting at `data_page_offset` leaves the
+  dictionary page outside every region — and for a low-cardinality column the
+  dictionary page *is* the set of distinct values.
+- `ColumnChunkMetaData::byte_range()` in arrow-rs **panics** on negative
+  offsets, which violates fail-closed. Read the fields and deny on malformed
+  input.
+- **`region.column` must be the full dotted `path_in_schema`**, which is a
+  `list<string>`. `region.column NOT IN ('salary')` does not block
+  `employee.salary`. Normalize case and pin the convention in the schema.
+- **Page index and bloom filters are column-attributed regions**, not generic
+  metadata: `{"kind":"column_index","column":"salary"}`. `ColumnIndex` leaks
+  per-**page** min/max and null counts; `OffsetIndex` leaks per-page row
+  counts. Both sit outside `total_compressed_size`.
+- Their offsets and lengths are **in the footer**, so classifying them needs no
+  second read — we need to know where they are, not what they contain. If
+  `bloom_filter_offset` is set without `bloom_filter_length`, mark from the
+  offset to the next known region as `unmapped` rather than guessing.
+- If `ColumnChunk.file_path` is set, the data is in another object. Deny.
 
-Format detection sniffs the key's extension, with a configuration override
-later.
+### COG
+
+- **GDAL block leader/trailer, the finding that would have broken the demo on
+  its first real file.** GDAL COGs declare `BLOCK_LEADER=SIZE_AS_UINT4` and
+  `BLOCK_TRAILER=LAST_4_BYTES_REPEATED` in a ghost area. `TileOffsets[i]`
+  points at the *payload*, so COG-aware readers fetch
+  `offset - 4 .. offset + len + 4`. A resolver mapping only
+  `[offset, offset+len)` sees every legitimate tile request overlap 8
+  unclassified bytes and, under default deny, denies all of them. The leader
+  and trailer belong to the tile region.
+- **Overview level is not the IFD index.** Derive it from the `ImageWidth`
+  ratio against full resolution. Masks are their own IFDs
+  (`NewSubfileType` bit 2), overviews set bit 0, masks of overviews set both.
+  Numbering by chain position mislabels masks as overview levels, and getting
+  the direction backwards silently inverts `region.overview_level >= 2` into
+  "anyone may read full resolution."
+- Follow `SubIFDs` (tag 330). GDAL ≥ 3.2 hangs overviews and masks there; a
+  resolver walking only the main chain leaves all their tile bytes unmapped.
+- `PlanarConfiguration = 2` makes tile count `SamplesPerPixel × TilesPerImage`
+  with per-plane grouping. Props have no plane component. Detect and fail
+  closed.
+- Tag values over 4 bytes (8 in BigTIFF) live outside the IFD, so
+  `TileOffsets`/`TileByteCounts`/GeoTIFF keys are **their own metadata
+  regions**, sitting between the IFDs and the pixel data. "The first N bytes
+  are metadata" is wrong even for well-formed COGs.
+- Support BigTIFF — anything over 4 GB is BigTIFF, and the doc's own
+  "100,000 regions" case implies it. Version `0x2B`, 16-byte header, 20-byte
+  IFD entries, u64 counts.
+- Georeferencing: handle `ModelTransformationTag` (rotated rasters make a tile
+  a quadrilateral, not a bbox) and fail closed on multi-tiepoint GCP-only
+  files. Overview IFDs generally do **not** repeat the georeferencing tags;
+  scale the full-resolution transform, and the OGC COG standard permits 2–10×
+  decimation, so the ratio is not necessarily a power of two.
+
+Use `tiff` 0.11, which exposes `Tag::Unknown(u16)` and `tag_iter()`, so private
+tags like `GDAL_METADATA` are reachable without a hand-rolled IFD parser.
+`async-tiff` has better primitives (`tile_byte_range`) but couples to
+`object_store`, whose `http` feature is the one arrow-rs path known broken on
+wasm32.
+
+### Zarr and Icechunk, deferred
+
+Recorded because they change the shape of things, not scheduled:
+
+- Zarr chunk identity is in the **key**, but the key grammar is not fixed —
+  v3 defaults to `precip/c/0/3/2`, v2 to a configurable `dimension_separator`.
+  Parsing a key requires first reading that array's metadata.
+  **Canonicalize the key and reject non-canonical forms** rather than
+  normalizing silently: `precip/../restricted/0.0.0` and its encoded variants
+  are a parser differential where policy sees one array and the backend serves
+  another.
+- Sharded v3 puts the index at `end` *by default*, not always
+  (`index_location` may be `start`), and the shard object is **not
+  self-describing** — index size is computed from array metadata as
+  `16 × chunks_per_shard + 4`. A shard index classified as blanket `metadata`
+  is a read *inside* a data object, and it leaks per-chunk compressed sizes,
+  which is a coarse content oracle.
+- Icechunk chunk refs have three variants, not one: **inline** (bytes live in
+  the manifest, so there is no byte range in any data object), native, and
+  **virtual** (a URL to a foreign object). Resolving one chunk costs up to four
+  round trips, manifests are zstd-compressed FlatBuffers with no random access,
+  and they index chunk→bytes while we need bytes→chunk, so the index is
+  per-snapshot and requires ingesting every manifest. `ObjectId` cannot select
+  it and ETag cannot key it. Virtual refs are a confused-deputy primitive:
+  an attacker-authored manifest names any object the gateway's credentials
+  reach. Allowlist virtual targets and re-authorize against the target's own
+  policy.
 
 ## Policy language
 
-CQL2, evaluated by `developmentseed/cql2-rs`. That crate already provides
-`Expr::matches(&Value) -> bool`, genuinely computed spatial predicates over the
-`geo` crate, temporal and array operators, a `wasm` workspace member published
-as `cql2-wasm`, and `ToDuckSQL`. It is our own crate, so anything we have to
-fix is in-house work that STAC benefits from too.
+CQL2, evaluated by `developmentseed/cql2-rs` (v0.6). The audience already
+writes CQL2 against STAC.
 
-The audience already writes CQL2 filters against STAC. They learn nothing new.
-
-A policy is a list of CQL2 filters, OR'd, over a default deny:
+The real signature is
+`Expr::matches(self, Option<&Value>) -> Result<bool, Error>` — it *consumes*
+`self`, so per-region evaluation clones the expression.
 
 ```yaml
-# role: analyst
+# role: licensee
 allow:
   - "region.kind = 'metadata'"
   - "region.kind = 'column_chunk' AND region.column NOT IN ('salary','ssn')"
   - "region.kind = 'tile' AND region.overview_level >= 2"
-  - "region.kind = 'tile' AND S_INTERSECTS(region.bbox, POLYGON((...)))"
+  - "user.role = 'licensee' AND region.kind = 'tile' AND S_INTERSECTS(region.geom, POLYGON((...)))"
 ```
 
-The last two rules are the case worth demonstrating: anyone may browse
-overviews, full resolution only inside a licensed AOI.
-
-### Why there is no allow/deny effect
-
-`deny` is syntactic sugar for `NOT`. CQL2 is closed under negation, so default
-deny plus one expression is formally complete. An explicit effect buys only
-precedence across independently authored policies — an org policy, a dataset
-policy, a user grant — which is out of scope. It is not free: adding `deny`
-obliges us to document precedence, and precedence bugs are the expensive kind.
-
-Add it when a second policy source actually appears. This is the known
+Filters are OR'd over a default deny. There is no `effect: deny`, because
+`deny` is syntactic sugar for `NOT` and CQL2 is closed under negation. An
+explicit effect buys only precedence across independently authored policies,
+which is out of scope, and costs documented precedence rules. This is the known
 extension point.
 
-### Fail closed
+### Verified behavior, and what it forces
 
-Every failure denies: an unparseable range header, a missing index, a CQL2
-evaluation error, a filter naming a property that does not exist. `cql2-rs`
-leaves unresolvable properties unfolded rather than erroring, so a typo in a
-property name must be caught by the wrapper and denied. This is a test case,
-not a comment.
+Every claim below was executed against the crate, not read.
 
-Metadata regions are the sole exception, and only because a policy explicitly
-allows them.
+- **`S_INTERSECTS` against a bare `bbox` array never returns true.** Untagged
+  deserialization matches `[-105,40,-104,41]` as `Array` before anything
+  geometric, and `is_region()` accepts only `Geometry` and `BBox`. It returns
+  `Err("Could not reduce expression to boolean")`. The normative cql2-json
+  schema defines a bbox literal as the *object* `{"bbox":[...]}`. **Props emit
+  a GeoJSON geometry under `region.geom`**, plus `{"bbox":[...]}` under
+  `region.bbox` for arithmetic rules.
+- **Property typos cannot be caught at evaluation time.** `matches()` returns
+  `Err(NonReduced)` for a simple unresolved property, but `region.knid IS NULL`
+  returns `Ok(true)` — `isNull` folds an absent property to true — and boolean
+  absorption (`FALSE AND x`, `TRUE OR x`) swallows a typo'd operand whenever a
+  sibling decides the result. So the obvious test passes while proving nothing.
+  **Policies are validated at load** by walking `Expr::Property` nodes against
+  a declared queryables schema per format and per region kind. `IS NULL` is
+  banned in policies.
+- **`Err` from `matches()` denies the whole request**, not just that rule. An
+  unguarded rule such as `region.column NOT IN (...)` errors against every tile
+  region, so guard clauses like `region.kind = 'column_chunk' AND ...` are
+  load-bearing security controls, enforced today only by author discipline —
+  hence load-time validation.
+- Type mismatch is a hard error: `region.overview_level >= '2'` dies against a
+  numeric property. YAML is string-typed; this will bite.
+- `IN` compares rendered text, so `region.x IN (12)` is true and
+  `region.x IN ('12')` is false for the same number.
+- Identifiers are case-sensitive; operator spellings are not.
+- **Props must be scalars plus one whitelisted geometry.** `Expr::try_from`
+  is untagged, so a props value shaped like `{"property":"user.id"}` or
+  `{"op":...}` becomes that AST node rather than data. Props are synthesized
+  from file-derived metadata (Parquet key-value metadata, TIFF tags). Never
+  pass raw nested file JSON through. Never emit `null` — absent and null are
+  indistinguishable and comparing against null errors.
+- The evaluation context must not contain a `properties` key: lookup falls back
+  to `properties.{name}`, so data could shadow a policy name.
+- **Build filters as AST nodes, never by string concatenation.** Interpolating
+  a polygon into filter *text* is a CQL2 injection whenever the AOI comes from
+  a licence record rather than a literal.
+- **Performance: ~20.6 µs per AOI evaluation**, almost all of it re-parsing the
+  policy's GeoJSON through WKT on every call, because `matches` consumes the
+  expression. 200 tiles × 4 rules ≈ 16 ms natively, worse in WASM. The fix —
+  pre-convert literal geometry operands at policy load and add
+  `matches(&self, ..)` — is upstream work in our own crate. Named as work, not
+  assumed away.
+- `matches()` has **one upstream test**, and it does not cover the `Err` path
+  our fail-closed story depends on. cnac owns testing it.
+
+### CRS is a fail-open hazard
+
+`geo` is planar and CRS-agnostic. Tile bboxes come from the raster's own CRS
+(usually projected metres); the AOI polygon is written by a human. A policy
+polygon authored in Web Mercator metres **contains every degree-scale bbox in
+a 4326 raster**, so `S_INTERSECTS` is true for every tile at every level and
+the whole image is served. Nothing errors.
+
+Carry the CRS and axis order in props and in the policy, and **refuse to
+evaluate a spatial predicate across mismatched CRS.**
 
 ## Denial semantics
 
-The proof of concept returns **403**. This breaks readers mid-query, which is
-honest about the cost.
+403. This breaks readers mid-query, which is honest about the cost. Zero-fill
+(plausible for COG tiles, corrupt for Parquet without synthesized null pages)
+and footer rewriting (best client experience, most work) are the alternatives,
+and neither is built here.
 
-Two alternatives are worth naming and neither is built here:
+## Implementation shape
 
-- **Zero-fill.** Return the correct byte count, zeroed. Works acceptably for
-  COG tiles, which render black. Produces corrupt pages in Parquet unless valid
-  all-null pages are synthesized, which is real work.
-- **Rewrite the footer.** Serve a Parquet footer or TIFF IFD in which the
-  forbidden columns or tiles do not appear. Much the best client experience —
-  the data simply is not there — and much the most implementation.
+One crate. `src/`, `web/`, `data/`. The wasm-bindgen shim is ~40 lines behind
+`#[cfg(target_arch = "wasm32")]`; a second crate would buy a workspace, two
+manifests and version sync for that.
 
-## Range coalescing
+Pins, all verified to build for `wasm32-unknown-unknown`:
+`parquet 59.3` with `default-features = false` (footer thrift is never
+compressed, so no codec features are needed), `tiff 0.11`, `geo 0.33`,
+`cql2 0.6`, and `getrandom` as a **direct** dependency with the `wasm_js`
+feature — a transitive dependency cannot have that feature enabled.
 
-Readers merge nearby ranges into single fetches. One request can therefore
-straddle a permitted and a forbidden column and be denied as a whole, failing a
-query that should have succeeded. This is the main practical obstacle to the
-whole approach.
-
-The demo surfaces it explicitly rather than hiding it, because how often it
-bites in practice is the finding that should decide whether `multistore` adopts
-this.
-
-## Analytics
-
-The same resolver, pointed at a log of past requests, counts hits per region
-instead of authorizing them. CQL2 filters the log the same way it filters
-access — one language, both features. `ToDuckSQL` makes a log stored as Parquet
-queryable directly.
+Bundle is ~900 KB raw / ~300 KB brotli, of which **cql2 is 82%**: it has no
+`[features]` section, so `sqlparser`, `jiff` + tzdb and `jsonschema` are all
+mandatory. Feature-gating them upstream is the only lever that matters, and
+nothing else we do to bundle size will show. Do not reuse the published
+`cql2-wasm` npm package (3.75 MB, no release profile, and behind the crate).
 
 ## Web demo
 
-Static, hosted on GitHub Pages, WASM over the same core crate.
+Static, on GitHub Pages, WASM over the same crate.
 
-- **Live mode.** `hyparquet` and `geotiff.js` read real sample files through a
-  `fetch` shim that applies the policy to every `Range` header. Watch a query
-  work, tighten the policy, watch it fail. The gateway's own footer read appears
-  in the log as its own entry.
-- **Replay mode.** Recorded logs drive the heatmap.
-- Parquet renders as a row-group by column grid. COG renders as a tile grid per
-  overview level with a click-drawn AOI. No basemap.
-- Denying `region.kind = 'metadata'` is allowed, and breaks everything. That
-  teaches the constraint better than a paragraph does.
+Interception happens at hyparquet's `AsyncBuffer` and geotiff.js's source, not
+a `fetch` shim — those are the libraries' own range-fetch seams.
 
-The WASM boundary is two functions:
+- Parquet renders as a row-group × column grid, COG as a tile grid per overview
+  level. CSS grid, not canvas.
+- Spatial policy uses two or three **preset AOI polygons** that paste a
+  `POLYGON(...)` into the policy textarea. Real `S_INTERSECTS` over `geo`, real
+  tiles going dark, for a string constant each. Click-to-draw is ~150 lines of
+  screen→pixel→geo transform and is not the finding.
+- The heatmap is a second colorway on the same grid — hit counts instead of
+  allow/deny — fed by the log live mode already emits. No separate replay mode,
+  no log file format: a recorded log cannot surface coalescing anyway, because
+  coalescing is a behavior of the live reader.
+- Denying `region.kind = 'metadata'` is permitted, and breaks everything. That
+  teaches the constraint better than a paragraph.
+- **A visible counter for ranges issued, ranges straddling a boundary, and
+  query outcome.** This is the deliverable.
 
-```
-build_index(fetcher, object_id, format) -> LayoutIndex
-check(index, policy, ctx, range_header) -> {decision, regions, matched_rule}
-```
-
-## Layout
-
-```
-crates/cnac-core/   resolvers (parquet, cog), policy evaluation over cql2::Expr
-crates/cnac-wasm/   the two exported functions
-web/                static site for GitHub Pages
-data/               small sample .parquet and .tif, recorded request logs
-```
+Sample files must be large enough for coalescing to bite — multi-row-group,
+multi-column-chunk Parquet, and a tiled COG with real overviews. A file small
+enough to be fetched in one range measures zero straddles and reports a false
+negative. Tens of MB is fine; Pages caps files at 100 MB.
 
 ## Testing
 
-- **Round trip.** For every region in an index, a request for exactly its byte
-  range resolves to exactly that region and nothing else.
-- **Golden offsets.** Known column chunk and tile offsets in checked-in sample
-  files resolve to the expected identities.
-- **Fail closed.** A filter naming a nonexistent property denies.
-- **Coalescing.** A range spanning a permitted and a forbidden region denies.
+- **Coverage invariant.** The union of all regions equals `[0, object_size)`.
+  One assertion, and it kills the unmapped-range bypass and the Parquet
+  dictionary-page gap together.
+- **Golden offsets** against checked-in fixtures, including a nested-column
+  Parquet and a GDAL COG with leader/trailer, overviews, and a mask IFD.
+- **Boundary cases at ±1** around every region edge, plus suffix, open-ended,
+  zero-length, past-EOF, and absent-Range requests.
+- **Fail closed**: a policy referencing an undeclared property is rejected *at
+  load*; `Err` from `matches` denies.
 
 ## What this does not do
 
-This reduces access and enforces licensing. It is not confidentiality.
+This reduces access and enforces licensing. **It is not confidentiality, and
+it is not an access gate** — it is a sub-object filter that presumes an
+object-level authorization decision made elsewhere. Where no policy matches a
+path, deny.
 
-Metadata is served intact, so a denied Parquet column still reveals its name,
-its type, its size, and — through footer statistics and any bloom filter — its
-per-row-group minimum and maximum and answers to membership queries. Hiding
-that a column exists requires rewriting the footer, which is out of scope.
+- Metadata is served intact, so a denied column's name, type and size leak.
+  Footer statistics and any bloom filter leak values — and the page index makes
+  that **per-page** (~20k rows) min/max, null counts and row counts, not
+  per-row-group. For a sorted column that approaches reconstructing the
+  distribution.
+- **The AOI is recoverable.** Probing tile ranges and observing 403 versus 206
+  recovers the licensed boundary at tile granularity in O(tiles) requests. The
+  AOI is often itself the sensitive thing.
+- **Data outside the AOI is delivered.** `S_INTERSECTS` at tile granularity
+  serves any tile *touching* the AOI, in full. The effective licensed area is
+  the AOI dilated to tile boundaries; an AOI smaller than one tile yields a
+  whole tile.
+- **The web demo enforces nothing.** Policy, principal and interception all run
+  client-side, and the sample files are readable by `curl`. It visualizes a
+  decision; it is not an enforcement point.
+- Index construction is reachable by a principal who may read nothing: a denied
+  request still costs the gateway a privileged footer read, and cache-occupancy
+  timing reveals whether someone else recently touched an object.
+- `endpoint` must never derive from client input, or it is a credentialed SSRF
+  primitive.
+- Allow/deny is *not* a value oracle — the decision depends only on layout,
+  never on data values. The value leakage is entirely through served metadata.
 
-Do not deploy this as a privacy control.
+### Cache validity
+
+Key the index cache on the full tuple `(endpoint, bucket, key, version_id,
+format, etag)`, never the ETag alone. ETag is not a trustworthy content digest:
+S3 multipart ETags are hash-of-hashes, SSE-KMS ETags are not content hashes,
+CDNs rewrite them, and single-part ETags are MD5 — which is chosen-prefix
+collidable, so where a principal can write the protected path they can swap in
+a file whose *footer relabels the column chunks* while the ETag is unchanged.
+The sound fix is `If-Match: <etag the index was built from>` on the authorized
+data fetch, so the backend refuses to serve bytes from a different version.
