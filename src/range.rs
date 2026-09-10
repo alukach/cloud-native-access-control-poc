@@ -31,12 +31,52 @@ pub enum RangeError {
 ///   costs a spec-legal but never-seen-in-practice spelling and fails closed
 ///   (the caller denies), while accepting it would widen our surface for no
 ///   gain.
+///
+/// # Returned range
+///
+/// The returned range is non-empty, non-inverted and within `0..size`
+/// *whenever `size > 0`*. The single exception is a zero-byte object with no
+/// `Range` header, which yields the empty `0..0`. Absent header means "not a
+/// range request", and zero-byte objects are ordinary (S3 directory markers,
+/// empty manifests, `_SUCCESS` files), so answering `NotSatisfiable` there
+/// would be wrong; the deliberate consequence is that the downstream `check()`
+/// resolves `0..0` to zero regions and denies. That is blunt but correct-by-
+/// default for empty objects, and it is a decision rather than an oversight:
+/// an empty object carries no bytes to disclose, so denying costs nothing a
+/// caller cannot special-case above this layer.
+///
+/// # Error kinds are a disclosure channel
+///
+/// `Unparseable` and `NotSatisfiable` are kept distinct so a caller can map
+/// them to 400 and 416, but the distinction itself leaks. `NotSatisfiable`
+/// depends on `size`; `Unparseable` never does. Concretely,
+/// `parse(Some("bytes=N-"), size)` returns `NotSatisfiable` iff `N >= size`.
+/// That is a monotone predicate on `N`, so an attacker who can observe the two
+/// outcomes binary-searches the exact object size in 64 probes at any
+/// magnitude -- object size alone is often enough to fingerprint a file, and
+/// it is available before any byte is read.
+///
+/// The invariant callers must hold: **authorize first, and never let the
+/// `NotSatisfiable` vs `Unparseable` distinction reach a principal who could
+/// not have read the object.** For an unauthorized principal both kinds must
+/// collapse into the identical denial response -- same status, same body, same
+/// headers, and in particular no `Content-Range: bytes */SIZE`. Only once the
+/// principal is known to be permitted to read the extent may the kinds be
+/// reported apart.
 pub fn parse(header: Option<&str>, size: u64) -> Result<Range<u64>, RangeError> {
-    if size == 0 {
-        return Err(RangeError::NotSatisfiable);
-    }
+    // Before the size guard: no Range header is not a range request, so there
+    // is nothing to find unsatisfiable, not even on a zero-byte object.
     let Some(h) = header else { return Ok(0..size) };
 
+    // ---- Phase 1: syntax. Nothing here may consult `size`. -----------------
+    //
+    // Validating the grammar in full before looking at `size` is what keeps a
+    // header's error kind independent of the object. Short-circuiting on
+    // `size == 0` first would answer `NotSatisfiable` for headers that were
+    // never syntactically valid (`BYTES=0-9`, `bytes=`, `bytes=٠-٩`), and a
+    // caller mapping that to `416 + Content-Range: bytes */0` would hand an
+    // attacker a one-request "is this object empty?" oracle keyed on a header
+    // the grammar already rejects.
     let spec = h.strip_prefix("bytes=").ok_or(RangeError::Unparseable)?;
     if spec.contains(',') {
         return Err(RangeError::Unparseable);
@@ -51,27 +91,41 @@ pub fn parse(header: Option<&str>, size: u64) -> Result<Range<u64>, RangeError> 
         s.parse().map_err(|_| RangeError::Unparseable)
     };
 
-    match (start_s.is_empty(), end_s.is_empty()) {
-        // bytes=-N : the last N bytes
-        (true, false) => {
-            let n = digits(end_s)?;
+    enum Spec {
+        /// `bytes=-N` : the last N bytes
+        Suffix(u64),
+        /// `bytes=N-` : from N to the end
+        From(u64),
+        /// `bytes=A-B` : inclusive of B on the wire, exclusive here
+        Closed(u64, u64),
+    }
+
+    let spec = match (start_s.is_empty(), end_s.is_empty()) {
+        (true, false) => Spec::Suffix(digits(end_s)?),
+        (false, true) => Spec::From(digits(start_s)?),
+        (false, false) => Spec::Closed(digits(start_s)?, digits(end_s)?),
+        (true, true) => return Err(RangeError::Unparseable),
+    };
+
+    // ---- Phase 2: satisfiability against `size`. ---------------------------
+    if size == 0 {
+        return Err(RangeError::NotSatisfiable);
+    }
+
+    match spec {
+        Spec::Suffix(n) => {
             if n == 0 {
                 return Err(RangeError::NotSatisfiable);
             }
             Ok(size.saturating_sub(n)..size)
         }
-        // bytes=N- : from N to the end
-        (false, true) => {
-            let start = digits(start_s)?;
+        Spec::From(start) => {
             if start >= size {
                 return Err(RangeError::NotSatisfiable);
             }
             Ok(start..size)
         }
-        // bytes=A-B : inclusive of B on the wire, exclusive here
-        (false, false) => {
-            let start = digits(start_s)?;
-            let end_incl = digits(end_s)?;
+        Spec::Closed(start, end_incl) => {
             if start > end_incl || start >= size {
                 return Err(RangeError::NotSatisfiable);
             }
@@ -82,7 +136,6 @@ pub fn parse(header: Option<&str>, size: u64) -> Result<Range<u64>, RangeError> 
             // underflow -- size == 0 returned above.
             Ok(start..end_incl.min(size - 1) + 1)
         }
-        (true, true) => Err(RangeError::Unparseable),
     }
 }
 
@@ -143,6 +196,45 @@ mod tests {
     #[test]
     fn zero_length_object_has_no_satisfiable_range() {
         assert!(parse(Some("bytes=0-0"), 0).is_err());
+    }
+
+    // A request with no Range header is not a range request, so there is
+    // nothing to find unsatisfiable -- not even on a zero-byte object, which
+    // is an ordinary thing to store (directory markers, empty manifests,
+    // `_SUCCESS` files). The empty range that comes back is the documented
+    // exception to "always non-empty"; `check()` resolves it to zero regions
+    // and denies.
+    #[test]
+    fn absent_header_on_an_empty_object_is_the_empty_range() {
+        assert_eq!(parse(None, 0).unwrap(), 0..0);
+    }
+
+    // The error kind must depend only on the header, never on the object.
+    // Answering `NotSatisfiable` for a syntactically invalid header just
+    // because the object happens to be empty gives a caller that emits
+    // `416 + Content-Range: bytes */0` a one-request "is this object empty?"
+    // oracle -- reachable with a header the grammar rejects outright.
+    #[test]
+    fn syntax_errors_do_not_depend_on_object_size() {
+        for h in [
+            "BYTES=0-9",
+            "bytes=",
+            "bytes=-",
+            "bytes=٠-٩",
+            "not-a-range-header-at-all",
+            "",
+            " bytes=0-9",
+            "bytes=0-19,40-59",
+            "bytes= 0-9",
+            "bytes=1--5",
+            "bytes=0-99999999999999999999999",
+        ] {
+            let empty = parse(Some(h), 0);
+            let sized = parse(Some(h), 100);
+            assert_eq!(empty, Err(RangeError::Unparseable), "size 0: {h}");
+            assert_eq!(sized, Err(RangeError::Unparseable), "size 100: {h}");
+            assert_eq!(empty, sized, "size-dependent error kind: {h}");
+        }
     }
 
     // A last-byte-pos of u64::MAX must clamp like any other past-EOF end, not
