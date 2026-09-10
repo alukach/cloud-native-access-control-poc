@@ -1,5 +1,6 @@
 pub mod decision;
 pub mod index;
+pub mod parquet;
 pub mod policy;
 pub mod range;
 
