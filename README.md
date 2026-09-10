@@ -130,6 +130,13 @@ object-level decision made elsewhere.
   the browser, and the sample files are readable with `curl`. It visualizes a
   decision; it is not an enforcement point.
 
+Each of these is tracked as a GitHub issue, along with the deferred formats
+(Zarr, Icechunk) and the gateway-integration contract multistore would need to
+honour. See [all open issues](https://github.com/alukach/cloud-native-access-control-poc/issues),
+or the [`known-limitation`](https://github.com/alukach/cloud-native-access-control-poc/labels/known-limitation)
+and [`security`](https://github.com/alukach/cloud-native-access-control-poc/labels/security)
+labels specifically.
+
 ## Layout
 
 ```
