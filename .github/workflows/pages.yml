@@ -66,33 +66,54 @@ jobs:
       - uses: actions/checkout@v4
       - name: Assert range support and no compression on binary assets
         env:
-          URL: ${{ needs.deploy.outputs.page_url || format('https://{0}.github.io/{1}/', github.repository_owner, github.event.repository.name) }}
+          URL: ${{ needs.deploy.outputs.page_url }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           fail=0
           check() {
             local path="$1"
             local url="${URL%/}/$path"
+            # -L: a custom domain redirects, and the redirect target is what a
+            # browser actually fetches. Checking the pre-redirect response
+            # verifies the wrong server.
             local code
-            code=$(curl -sS -o /dev/null -w '%{http_code}' "$url" || echo 000)
+            code=$(curl -sSL -o /dev/null -w '%{http_code}' "$url")
+            if [ "$code" = "404" ]; then
+              echo "skip $path (404, not published yet)"
+              return 0
+            fi
             if [ "$code" != "200" ]; then
-              echo "skip $path (HTTP $code, not published yet)"
+              # Anything else is unexpected and must not pass silently.
+              echo "  FAIL: $path returned HTTP $code"
+              fail=1
               return 0
             fi
             echo "checking $path"
             local hdrs
-            hdrs=$(curl -sSI "$url")
+            hdrs=$(curl -sSIL "$url")
             grep -qi '^accept-ranges: bytes' <<<"$hdrs" \
               || { echo "  FAIL: no accept-ranges: bytes"; fail=1; }
             if grep -qi '^content-encoding:' <<<"$hdrs"; then
-              echo "  FAIL: served compressed; ranges would slice the compressed stream"
+              echo "  FAIL: served compressed; a range would slice the compressed stream"
               fail=1
             fi
-            local rcode
-            rcode=$(curl -sS -o /dev/null -w '%{http_code}' -H 'Range: bytes=0-19' "$url")
-            [ "$rcode" = "206" ] \
-              || { echo "  FAIL: Range request returned $rcode, expected 206"; fail=1; }
+            # The load-bearing assertion. An intermediary that ignores Range
+            # returns 200 with the ENTIRE representation (RFC 9110 s14.2),
+            # which is exactly the disclosure this project exists to prevent
+            # and would silently break the demo's Live mode.
+            local rhdrs
+            rhdrs=$(curl -sSIL -H 'Range: bytes=0-19' "$url")
+            if ! grep -qiE '^HTTP/[0-9.]+ 206' <<<"$rhdrs"; then
+              echo "  FAIL: ranged request did not return 206:"
+              grep -iE '^HTTP/|^content-range|^server' <<<"$rhdrs" | sed 's/^/    /'
+              fail=1
+            fi
           }
+          if [ -z "${URL:-}" ]; then
+            echo "FAIL: no page_url from the deploy job"
+            exit 1
+          fi
+          echo "base URL: $URL"
           check "pkg/cnac_bg.wasm"
           for f in data/*; do
             [ -e "$f" ] && check "$f"
