@@ -249,14 +249,20 @@ pub struct LayoutIndex {
 impl LayoutIndex {
     /// Panics on a malformed region set.
     ///
-    /// For tests and for region sets that are correct by inspection at the call
-    /// site. **Every path that begins with parsed file bytes must use
-    /// [`LayoutIndex::try_new`]**, and not out of style preference: this crate
+    /// **Test-only**, and gated so that the compiler enforces it rather than
+    /// this comment. Every path that begins with parsed file bytes must use
+    /// [`LayoutIndex::try_new`], and not out of style preference: this crate
     /// compiles to wasm32, where the panic runtime aborts. There is no unwind
     /// to catch, the module instance is poisoned, and a gateway that hosts one
     /// instance per worker turns a malformed footer into an availability bug
     /// for every request that worker would have served. A `Result` at the parse
     /// boundary costs one `?`.
+    ///
+    /// The only non-test callers this would ever have are the format resolvers,
+    /// whose whole input is attacker-supplied bytes, so leaving a panicking
+    /// constructor in the public API buys nothing and offers exactly the wrong
+    /// shortcut to whoever writes them.
+    #[cfg(test)]
     #[track_caller]
     #[must_use]
     pub fn new(regions: Vec<Region>, size: u64) -> Self {

@@ -1,4 +1,5 @@
 pub mod index;
+pub mod policy;
 pub mod range;
 
 pub fn version() -> &'static str {
