@@ -48,13 +48,20 @@ pub enum RangeError {
 /// # Error kinds are a disclosure channel
 ///
 /// `Unparseable` and `NotSatisfiable` are kept distinct so a caller can map
-/// them to 400 and 416, but the distinction itself leaks. `NotSatisfiable`
-/// depends on `size`; `Unparseable` never does. Concretely,
-/// `parse(Some("bytes=N-"), size)` returns `NotSatisfiable` iff `N >= size`.
-/// That is a monotone predicate on `N`, so an attacker who can observe the two
-/// outcomes binary-searches the exact object size in 64 probes at any
-/// magnitude -- object size alone is often enough to fingerprint a file, and
-/// it is available before any byte is read.
+/// them to 400 and 416, but the distinction itself leaks, and it does so
+/// without exception: **every `NotSatisfiable` is a function of `size`, and no
+/// `Unparseable` ever is.** Syntax is decided in full before `size` is read, so
+/// the two kinds partition cleanly -- observing `Unparseable` tells an attacker
+/// only that the header was malformed, and observing `NotSatisfiable` always
+/// tells them something about the object. There is no third case and no
+/// size-independent `NotSatisfiable` to reason around; a caller either leaks
+/// size information or it does not.
+///
+/// Concretely, `parse(Some("bytes=N-"), size)` returns `NotSatisfiable` iff
+/// `N >= size`. That is a monotone predicate on `N`, so an attacker who can
+/// observe the two outcomes binary-searches the exact object size in 64 probes
+/// at any magnitude -- object size alone is often enough to fingerprint a file,
+/// and it is available before any byte is read.
 ///
 /// The invariant callers must hold: **authorize first, and never let the
 /// `NotSatisfiable` vs `Unparseable` distinction reach a principal who could
@@ -103,7 +110,24 @@ pub fn parse(header: Option<&str>, size: u64) -> Result<Range<u64>, RangeError> 
     let spec = match (start_s.is_empty(), end_s.is_empty()) {
         (true, false) => Spec::Suffix(digits(end_s)?),
         (false, true) => Spec::From(digits(start_s)?),
-        (false, false) => Spec::Closed(digits(start_s)?, digits(end_s)?),
+        (false, false) => {
+            let (start, end_incl) = (digits(start_s)?, digits(end_s)?);
+            // RFC 9110 14.1.1: "A byte-range-spec is invalid if the
+            // last-byte-pos value is present and less than the
+            // first-byte-pos." That is a grammar condition, so it belongs
+            // here and not in phase 2. 416 is defined (15.5.17) for a VALID
+            // byte-range-set in which no range is satisfiable, which
+            // `bytes=5-4` never was. Classifying it as NotSatisfiable also
+            // made it the sharpest instance of the size oracle: the verdict
+            // is size-independent, so one fixed header yielded a
+            // `Content-Range: bytes */SIZE` disclosure with no probing at
+            // all. `bytes=1--5` already lands on Unparseable via `digits`,
+            // so this is also what makes the two consistent.
+            if start > end_incl {
+                return Err(RangeError::Unparseable);
+            }
+            Spec::Closed(start, end_incl)
+        }
         (true, true) => return Err(RangeError::Unparseable),
     };
 
@@ -126,7 +150,8 @@ pub fn parse(header: Option<&str>, size: u64) -> Result<Range<u64>, RangeError> 
             Ok(start..size)
         }
         Spec::Closed(start, end_incl) => {
-            if start > end_incl || start >= size {
+            // `start <= end_incl` was established in phase 1.
+            if start >= size {
                 return Err(RangeError::NotSatisfiable);
             }
             // Clamp the last byte position BEFORE converting to exclusive.
@@ -237,6 +262,27 @@ mod tests {
         }
     }
 
+    // `bytes=5-4` was the sharpest instance of the size oracle and gets its
+    // own test. An inverted spec is invalid per RFC 9110 14.1.1 regardless of
+    // the object, so the verdict is size-independent -- which is exactly what
+    // made classifying it as NotSatisfiable dangerous: one fixed, never-valid
+    // header drew a `Content-Range: bytes */SIZE` out of every non-empty
+    // object, with no probing at all. It is now the syntax error it always
+    // was, and this pins that it stays one at every size.
+    #[test]
+    fn an_inverted_spec_is_a_syntax_error_at_every_size() {
+        for size in [0, 1, 100, u64::MAX] {
+            assert_eq!(
+                parse(Some("bytes=5-4"), size),
+                Err(RangeError::Unparseable),
+                "size {size}"
+            );
+        }
+        // The boundary stays satisfiable: equal positions are one byte, not
+        // an inverted spec.
+        assert_eq!(parse(Some("bytes=4-4"), 100).unwrap(), 4..5);
+    }
+
     // A last-byte-pos of u64::MAX must clamp like any other past-EOF end, not
     // overflow: `end_incl + 1` panics in debug and wraps to an empty 0..0 in
     // release, and an empty authorized extent that the backend answers with
@@ -331,12 +377,12 @@ mod tests {
     #[test]
     fn error_kinds_separate_syntax_from_satisfiability() {
         assert_eq!(parse(Some("items=0-5"), 100), Err(RangeError::Unparseable));
+        // RFC 9110 14.1.1 makes last-byte-pos < first-byte-pos a grammar
+        // violation, not a satisfiability failure, so this sits with the
+        // syntax errors despite naming two well-formed integers.
+        assert_eq!(parse(Some("bytes=5-4"), 100), Err(RangeError::Unparseable));
         assert_eq!(
             parse(Some("bytes=999999-"), 100),
-            Err(RangeError::NotSatisfiable)
-        );
-        assert_eq!(
-            parse(Some("bytes=5-4"), 100),
             Err(RangeError::NotSatisfiable)
         );
         assert_eq!(parse(Some("bytes=0-0"), 0), Err(RangeError::NotSatisfiable));
