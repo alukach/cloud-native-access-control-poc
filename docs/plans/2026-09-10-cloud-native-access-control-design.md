@@ -331,7 +331,11 @@ compressed, so no codec features are needed), `tiff 0.11`, `geo 0.33`,
 `cql2 0.6`, and `getrandom` as a **direct** dependency with the `wasm_js`
 feature — a transitive dependency cannot have that feature enabled.
 
-Bundle is ~900 KB raw / ~300 KB brotli, of which **cql2 is 82%**: it has no
+Bundle is **~1.4 MiB** once real symbols are exported (measured at Task 1 with
+a representative `S_INTERSECTS` export; an empty cdylib measures 312 bytes
+because LTO strips the whole graph, which is not a meaningful baseline). That
+is ~60% above the pre-implementation estimate of ~900 KB. Of it, **cql2 is the
+dominant share**: it has no
 `[features]` section, so `sqlparser`, `jiff` + tzdb and `jsonschema` are all
 mandatory. Feature-gating them upstream is the only lever that matters, and
 nothing else we do to bundle size will show. Do not reuse the published
