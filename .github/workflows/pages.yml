@@ -117,6 +117,11 @@ jobs:
             echo "FAIL: no page_url from the deploy job"
             exit 1
           fi
+          # GitHub reports an http:// URL because Cloudflare terminates TLS,
+          # so Pages never provisions a certificate and https_enforced cannot
+          # be set. HTTPS works through Cloudflare, and the demo must use it:
+          # an https page cannot fetch http assets.
+          URL="https://${URL#http://}"
           echo "base URL: $URL"
           check "pkg/cnac_bg.wasm"
           for f in data/*; do
