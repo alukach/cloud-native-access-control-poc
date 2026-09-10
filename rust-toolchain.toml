@@ -2,4 +2,8 @@
 # Pinned, not floating: bundle size is a recorded finding for this project and
 # moves tens of KB across stable releases from codegen changes alone.
 channel = "1.98.1"
+# Named explicitly: a toolchain rustup auto-installs from this file is
+# minimal, so CI would not get rustfmt or clippy without this line even
+# though a developer machine usually has them already.
+components = ["rustfmt", "clippy"]
 targets = ["wasm32-unknown-unknown"]
