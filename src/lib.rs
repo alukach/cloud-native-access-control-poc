@@ -6,10 +6,16 @@ pub fn version() -> &'static str {
 mod tests {
     #[test]
     fn cql2_evaluates_a_spatial_predicate() {
-        let e: cql2::Expr = "S_INTERSECTS(geom, POINT(5 5))".parse().unwrap();
         let ctx = serde_json::json!({
             "geom": {"type":"Polygon","coordinates":[[[0,0],[10,0],[10,10],[0,10],[0,0]]]}
         });
-        assert!(e.matches(Some(&ctx)).unwrap());
+
+        let inside: cql2::Expr = "S_INTERSECTS(geom, POINT(5 5))".parse().unwrap();
+        assert!(inside.matches(Some(&ctx)).unwrap());
+
+        // The direction that matters for an authorization crate: a regression
+        // that made `matches` fail open would pass the assertion above alone.
+        let outside: cql2::Expr = "S_INTERSECTS(geom, POINT(50 50))".parse().unwrap();
+        assert!(!outside.matches(Some(&ctx)).unwrap());
     }
 }

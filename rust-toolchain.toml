@@ -1,3 +1,5 @@
 [toolchain]
-channel = "stable"
+# Pinned, not floating: bundle size is a recorded finding for this project and
+# moves tens of KB across stable releases from codegen changes alone.
+channel = "1.98.1"
 targets = ["wasm32-unknown-unknown"]
