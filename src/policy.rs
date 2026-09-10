@@ -42,6 +42,49 @@ pub enum PolicyError {
     BannedOperator(String),
 }
 
+/// The default queryables schema: every property name a policy may mention.
+///
+/// The `region.*` half is not a matter of taste. It is exactly the key set
+/// [`Region::props`](crate::index::Region::props) emits, and it has to stay
+/// exactly that: a key here that `props` never emits is a rule that can be
+/// written and can never match (it unfolds and denies, silently), and a key
+/// `props` emits that is missing here is a rule that cannot be written at all
+/// even though the data is right there. Change one and change the other.
+///
+/// `region.geom` and `region.bbox` are two spellings of one tile extent --
+/// `props` emits both because a spatial rule may be written either way -- and
+/// both are absent from a non-tile region rather than null, per the no-null
+/// rule on `props`.
+///
+/// The `user.*` half is different in kind: those claims come from the
+/// deployment's token, not from this crate, so this list is a *default* and not
+/// an authority. A deployment with other claims passes its own slice to
+/// [`Policy::load`]. It is spelled out rather than wildcarded because
+/// [`validate`] matches property names exactly, and that is the point --
+/// `user.rol` has to fail to load, and a `user.*` wildcard would let it
+/// through to fail open at evaluation time instead.
+///
+/// This constant exists so the two test modules and the wasm binding cannot
+/// drift into three different schemas, which is how "the policy loads in the
+/// tests and is rejected in the browser" happens.
+pub const QUERYABLES: &[&str] = &[
+    // Claims. Deployment-specific; see above.
+    "user.role",
+    "user.level",
+    "user.groups",
+    // Every key `Region::props` can emit.
+    "region.kind",
+    "region.name",
+    "region.column",
+    "region.row_group",
+    "region.overview_level",
+    "region.x",
+    "region.y",
+    "region.geom",
+    "region.bbox",
+    "region.crs",
+];
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
@@ -206,20 +249,6 @@ fn validate(expr: &Expr, queryables: &[&str]) -> Result<(), PolicyError> {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    const QUERYABLES: &[&str] = &[
-        "user.role",
-        "region.kind",
-        "region.column",
-        "region.row_group",
-        "region.overview_level",
-        "region.x",
-        "region.y",
-        "region.geom",
-        "region.bbox",
-        "region.crs",
-        "region.name",
-    ];
 
     fn load(yaml: &str) -> Result<Policy, PolicyError> {
         Policy::load(yaml, QUERYABLES)
@@ -467,6 +496,69 @@ mod tests {
             json!({"region":{"kind":"tile","geom":{"type":"Point","coordinates":[50,50]}}});
         assert!(!p.permits(&outside));
         assert!(!p.permits(&outside));
+    }
+
+    /// The `region.*` half of [`QUERYABLES`] must be *exactly* the key set
+    /// `Region::props` emits, and neither direction of drift announces itself:
+    /// a key `props` emits but the schema omits is a rule that will not load
+    /// even though the data is there, and a key the schema declares but `props`
+    /// never emits is a rule that loads, unfolds and denies without a
+    /// diagnostic -- the failure mode this whole module exists to prevent,
+    /// reintroduced through the schema instead of through a typo.
+    ///
+    /// Every `RegionKind` variant is listed, so adding one without giving it a
+    /// queryable fails here rather than in a browser. The `Tile` case carries a
+    /// finite bbox and a `Some` crs on purpose: `props` omits `geom`, `bbox`
+    /// and `crs` otherwise, and a variant built the lazy way would leave three
+    /// declared properties looking unused.
+    #[test]
+    fn queryables_are_exactly_the_keys_region_props_emits() {
+        use crate::index::{Region, RegionKind};
+
+        let mut emitted: Vec<String> = [
+            RegionKind::Metadata {
+                name: "footer".into(),
+            },
+            RegionKind::Unmapped,
+            RegionKind::ColumnChunk {
+                column: "c".into(),
+                row_group: 0,
+            },
+            RegionKind::ColumnIndex { column: "c".into() },
+            RegionKind::BloomFilter { column: "c".into() },
+            RegionKind::Tile {
+                overview_level: 0,
+                x: 1,
+                y: 2,
+                bbox: [0.0, 0.0, 1.0, 1.0],
+                crs: Some(32610),
+            },
+        ]
+        .into_iter()
+        .flat_map(|kind| {
+            let props = Region {
+                start: 0,
+                len: 1,
+                kind,
+            }
+            .props();
+            let keys = props.as_object().expect("props is a JSON object");
+            keys.keys()
+                .map(|k| format!("region.{k}"))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+        emitted.sort();
+        emitted.dedup();
+
+        let mut declared: Vec<String> = QUERYABLES
+            .iter()
+            .filter(|q| q.starts_with("region."))
+            .map(|q| (*q).to_owned())
+            .collect();
+        declared.sort();
+
+        assert_eq!(emitted, declared);
     }
 
     /// Test-only helper: `unwrap_err` with the case named in the panic.

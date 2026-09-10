@@ -301,23 +301,8 @@ fn principal_is_addressable(user: &Value) -> bool {
 mod tests {
     use super::*;
     use crate::index::{Region, RegionKind};
+    use crate::policy::QUERYABLES;
     use serde_json::json;
-
-    const QUERYABLES: &[&str] = &[
-        "user.role",
-        "user.level",
-        "user.groups",
-        "region.kind",
-        "region.column",
-        "region.row_group",
-        "region.name",
-        "region.overview_level",
-        "region.x",
-        "region.y",
-        "region.geom",
-        "region.bbox",
-        "region.crs",
-    ];
 
     /// metadata `0..10`, column_chunk "public" `10..20`, column_chunk "salary"
     /// `20..30`, and size 40 -- so `30..40` is filled with `Unmapped` by
