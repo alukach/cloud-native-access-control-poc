@@ -1,0 +1,27 @@
+[package]
+name = "cnac"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cql2 = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+# No codec features needed: the Parquet footer thrift is never compressed.
+parquet = { version = "59.3", default-features = false }
+tiff = "0.11"
+# Direct dependency: a transitive dep cannot have this feature enabled for it.
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
