@@ -131,10 +131,48 @@ every `Content-Range`. Planning costs 3–5 ms and the artifact is cacheable on
 statistics, no bloom-filter pointers and no page-index pointers for the withheld
 columns. That was previously an accepted limitation of the whole approach.
 
+### The COG analogue: sparsify + scrub
+
+The same idea, and it lands better. To withhold a tile, zero its `TileOffsets`
+and `TileByteCounts` entries — which is precisely how a *sparse* COG represents
+a tile that was never written, and GDAL handles it natively.
+
+Measured with GDAL 3.13.3 against `data/s2-tci-512.tif`:
+
+| check | result |
+| --- | --- |
+| `gdalinfo` | same raster, CRS, `LAYOUT=COG` and five overviews — **no warning, no error** |
+| withheld pixels | all zero; 6,193,631 of them were non-zero in the original |
+| live pixels | **byte-identical**, 6,553,600 px × 3 bands |
+| nodata declared? | **irrelevant** — repeated on a COG built `-a_nodata none`, withheld tiles still read zero. The declaration decides what zero *means*, not whether the read works |
+| `/vsicurl` over HTTP | identical |
+
+End to end through the gateway, withholding 459 of 484 full-resolution tiles:
+
+| mode | `gdal_translate` | requests | straddling |
+| --- | --- | ---: | --- |
+| refuse | **failed** — `TIFFFillTile: Read error … got 0 bytes, expected 35803` on the first tile read | 4 | 3, all refused |
+| scrub | **ok** | 6 | **5, all served** |
+
+Three things make this cleaner than Parquet. The edit is **always same-length**
+— both halves are zeroes, so there is no re-serialization and no rewritten tail
+(17 spans, 272 bytes resident), and `virtual_size() == object_size()`, so `HEAD`
+and `ListObjects` still agree with the origin. There is no thrift codec and none
+of the schema traps. And planning costs ~19 ms for 459 tiles.
+
+Two refusals are deliberate. **Mask images are refused outright**: sparsify
+serves everything it does not blank, so a withheld tile's mask — a per-pixel map
+of exactly the footprint just removed — would go out live. Under `check` this
+was survivable because mask bytes were `Unmapped` and therefore denied; under
+sparsify it is a strict regression, so the object is refused until
+[#21](../../issues/21) lands a mask region kind. That generalizes to the rule
+the whole mode needs: **any object containing an unclassified byte is refused**,
+which also covers striped TIFFs and unknown TIFF field types.
+
 ## 4. Recommendation
 
-**Build the rewrite-and-scrub path. Keep refuse as the default for formats where
-rewriting is not yet implemented.**
+**Build the rewrite-and-scrub path — `rewrite` for Parquet, `sparsify` for COG.
+Keep refuse as the default for formats where neither is implemented.**
 
 The argument is not that rewriting is elegant. It is that every other mode
 requires the gateway to know how its clients batch reads, and §2 shows that is a
@@ -174,10 +212,6 @@ rewritten too.
   Every reader measured seeks by footer offset and never looks at them. One that
   scans sequentially would see a plausible empty structure rather than
   corruption. This is not a defragmented file.
-- **The COG analogue is unproven at the time of writing.** The plan is to zero
-  the `TileOffsets`/`TileByteCounts` of withheld tiles so the file reads as a
-  sparse COG, which GDAL handles natively. If it holds, the geospatial case is
-  solved by the same mechanism. It is being measured.
 - **Breadth.** One Parquet file, one codec, one flat schema; one COG. Untested:
   nested and repeated types, v2 data pages, encrypted files, hive datasets,
   BigTIFF, and every engine other than the five measured.
