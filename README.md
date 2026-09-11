@@ -189,8 +189,11 @@ whether the query completed. Measured here against the sample files:
 | --- | ---: | ---: | ---: | --- |
 | Parquet, library defaults | 10 | 8 | 15.9 kB | refused at the first row group |
 | Parquet, boundary-aligned | 34 | 0 | 1.41 MB | 400,000 rows |
-| COG, library defaults | 3 | 2 | 65.5 kB | refused at the first tile block |
-| COG, boundary-aligned | 13 | 0 | 351 kB | 1000×1000 px at full resolution |
+| COG, library defaults | 2 | 1 | 65.5 kB | refused at the first tile block |
+| COG, boundary-aligned | 13 | 0 | 111 kB | 1000×1000 px at full resolution |
+
+The refused COG range is one line of the log and says the whole thing: a
+393 kB run of 64 KB blocks covering 75 regions, 64 of them outside the licence.
 
 > **Do not use `python3 -m http.server`.** It ignores `Range` entirely and
 > answers `200` with the whole file (measured: a request for 20 bytes returns

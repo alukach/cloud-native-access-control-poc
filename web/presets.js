@@ -13,18 +13,23 @@ export const SCENE_EXTENT = [499980, 4090200, 609780, 4200000];
 const ring = ([x0, y0, x1, y1]) =>
   `POLYGON((${x0} ${y0},${x1} ${y0},${x1} ${y1},${x0} ${y1},${x0} ${y0}))`;
 
+// Both land areas sit in the northwest corner, which is where this granule
+// actually has terrain -- it is a swath-edge scene, mostly ocean and cloud.
+// They are chosen for size, not for looks: a full-resolution tile here is
+// 4,991 m across, so a 64 KB block spans several of them and reaches outside
+// any licence drawn at this scale.
 export const AOIS = [
   {
-    id: 'northwest',
-    name: 'Northwest block',
-    note: '10 km over the brightest part of the scene. Three tiles across at full resolution, which is small enough that one 64 KB block reaches well past the licence.',
-    bbox: [507660, 4150300, 517660, 4160300],
+    id: 'coast',
+    name: 'Coast and fields',
+    note: '10 km of coastline and cultivated land: nine tiles at full resolution, in a 3 × 3 block. One tile is 4,991 m across, so a 64 KB block covers a run of them and crosses the boundary on every side.',
+    bbox: [520000, 4188000, 530000, 4198000],
   },
   {
-    id: 'southwest',
-    name: 'Southwest block',
-    note: '10 km further down the same edge. Different tiles, same shape of answer.',
-    bbox: [506380, 4115090, 516380, 4125090],
+    id: 'headland',
+    name: 'Headland',
+    note: '5 km over the headland: four tiles, in a 2 × 2 block. Half the width for the same fixed block size, so the reader overshoots the licence proportionally further.',
+    bbox: [522000, 4194000, 527000, 4199000],
   },
   {
     id: 'scene',
