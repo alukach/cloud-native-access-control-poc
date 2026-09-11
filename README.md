@@ -75,13 +75,21 @@ Which tiles. Which areas. One resolver, two features.
 Findings from the design review, each of which would have broken a naive
 implementation:
 
-**Readers coalesce.** hyparquet merges column chunks into runs up to 2 MB, so a
-full-table scan collapses all 19 columns of a row group into *one* request that
-straddles every policy boundary you drew. Passing `columns: [...]` makes it
-issue one exact fetch per column chunk instead. geotiff.js block-aligns reads
-to 64 KB, not to tiles, unless `blockSize` is `undefined`. **Column masking
-works only when the reader projects columns** — that conditional is the finding
-this project exists to characterize.
+**Clients batch their reads, and that decides everything.** hyparquet merges
+column chunks into runs up to 2 MB, so a full-table scan collapses all 19
+columns of a row group into *one* request straddling every boundary you drew;
+passing `columns: [...]` makes it chunk-exact instead. geotiff.js block-aligns
+to 64 KB rather than to tiles unless `blockSize` is `undefined`.
+
+And **DuckDB — the client people actually use — straddles unavoidably.** It
+pushes projection down and prunes row groups by footer statistics, fetching
+11.9% of the object where a naive reader takes 98%. But its physical reads are
+64 KiB power-of-two blocks, so *27 of 27* of its content requests cross a column
+chunk it never projected. Deny a column and a query for its physical neighbour
+is refused; deny it and query something far away in the file and nothing
+happens. **Adjacency in the file decides, not the query.** That is why the
+denial mode, not the reader configuration, turns out to be the design decision
+([#24](https://github.com/alukach/cloud-native-access-control-poc/issues/24)).
 
 **`Range` is advisory, not a contract.** [RFC 9110 §14.2](https://www.rfc-editor.org/rfc/rfc9110#field.range)
 says a server MAY ignore a `Range` header, and an origin server **MUST** ignore
@@ -179,21 +187,32 @@ npx serve .                        # from the repository root
 Serve from the repository root, not from `web/` — the page reads the sample
 files in `data/`.
 
-The page's subject is a single toggle. Both readers are run twice over the same
-policy, principal and query, once at their library defaults and once configured
-to fetch one structure per request, and the counters for both positions stay on
-screen: ranges issued, ranges straddling a policy boundary, bytes fetched, and
-whether the query completed. Measured here against the sample files:
+You build a query, set a policy, and see what each client actually fetched.
+The query is a column picker taken from the loaded file's own schema; the
+policy is CQL2, validated as you type; and the run executes the same query
+through every client at once, gating every range it issues. Measured here
+against the sample files:
 
-| | ranges | straddling | bytes | outcome |
+| client | ranges | refused | bytes | outcome |
 | --- | ---: | ---: | ---: | --- |
-| Parquet, library defaults | 10 | 8 | 15.9 kB | refused at the first row group |
-| Parquet, boundary-aligned | 34 | 0 | 1.41 MB | 400,000 rows |
-| COG, library defaults | 2 | 1 | 65.5 kB | refused at the first tile block |
-| COG, boundary-aligned | 13 | 0 | 111 kB | 1000×1000 px at full resolution |
+| hyparquet, no projection | 10 | 8 | 15.9 kB | fails at the first row group |
+| hyparquet, columns pushed down | 34 | 0 | 1.41 MB | 400,000 rows from 4 columns |
+| geotiff.js, 64 KB blocks | 2 | 1 | 65.5 kB | fails at the first tile block |
+| geotiff.js, one structure per range | 13 | 0 | 111 kB | 1000×1000 px at full resolution |
 
-The refused COG range is one line of the log and says the whole thing: a
-393 kB run of 64 KB blocks covering 75 regions, 64 of them outside the licence.
+Change the column picker and the numbers move: one column instead of four
+gives 10 ranges and 1.1% of the file. Pick a column the policy withholds and
+the projected client flips to *fails* — and note it fails with **nothing
+straddling**, a flat refusal rather than a boundary crossing, which is a
+different failure worth being able to tell apart.
+
+**The denial mode is the design decision.** A gate can refuse any request
+covering forbidden bytes, or serve it with those bytes blanked. The crate
+supports both (`DenialMode`); the page currently runs refuse-only and says so.
+Which one you need is not a preference — it depends on the client. A projecting
+engine never parses the blanked bytes, so zero-fill is lossless for it; a client
+that reads every column parses the zeros and gets corrupt data instead of a
+clean refusal.
 
 > **Do not use `python3 -m http.server`.** It ignores `Range` entirely and
 > answers `200` with the whole file (measured: a request for 20 bytes returns
