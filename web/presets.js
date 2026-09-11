@@ -81,8 +81,15 @@ export function aoisFor(extent) {
   ];
 }
 
-/** The columns the Parquet query asks for. */
-export const QUERY_COLUMNS = [
+/**
+ * Where the column picker starts, for the file this page ships with.
+ *
+ * The chips themselves come from the loaded file's own index -- this is only
+ * the opening selection, and it is used only when every name in it is really
+ * in that file. Anything else starts from the first few columns the policy
+ * does not withhold.
+ */
+export const DEFAULT_COLUMNS = [
   'VendorID',
   'passenger_count',
   'trip_distance',
