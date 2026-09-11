@@ -1,19 +1,170 @@
 <!doctype html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
-<title>Cloud-native access control</title>
-<style>
-  body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; }
-  code { background: #f4f4f5; padding: .1em .3em; border-radius: 3px; }
-</style>
-<h1>Cloud-native access control</h1>
-<p>
-  Demo not built yet. This page exists so the Pages deployment and its hosting
-  assertions run from the first commit — the demo depends on GitHub Pages
-  serving byte ranges uncompressed, and that is worth verifying continuously
-  rather than discovering later.
-</p>
-<p>
-  See the
-  <a href="https://github.com/alukach/cloud-native-access-control-poc">repository</a>
-  for the design and implementation plan.
-</p>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Access control on part of a file</title>
+<meta name="description" content="A live demonstration of column-level and area-level access control over Parquet and COG byte ranges, evaluated with CQL2.">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<div class="rail">
+  <strong>cloud-native-access-control</strong>
+  <span id="version">loading wasm…</span>
+  <span id="hosting"></span>
+  <a href="https://github.com/alukach/cloud-native-access-control-poc">source</a>
+</div>
+
+<main class="wrap">
+
+  <div class="lede">
+    <h1>Access control on part of a file</h1>
+    <p>
+      Two real readers fetch two real files over HTTP range requests. Every range they ask for
+      is resolved to the column chunks or image tiles it lands in, and checked against the CQL2
+      policy below before it is fetched. The question this page answers is not whether a policy
+      can be written — it is whether a reader issues ranges a policy can act on.
+    </p>
+  </div>
+
+  <div class="columns">
+
+    <div class="side">
+      <section class="panel">
+        <header>
+          <h2>Policy</h2>
+          <span class="meta" id="queryable-count"></span>
+        </header>
+        <div class="body">
+          <div class="field-label">
+            <label for="policy">Rules</label>
+            <span class="meta num" id="policy-state"></span>
+          </div>
+          <textarea id="policy" spellcheck="false" aria-describedby="policy-diag"></textarea>
+          <div class="diag ok" id="policy-diag">Loading.</div>
+
+          <div class="field-label"><span>Start from</span></div>
+          <div class="chips" id="policy-presets"></div>
+          <p class="preset-note" id="preset-note"></p>
+
+          <div class="field-label"><span>Licensed area</span></div>
+          <div class="chips" id="aoi-presets"></div>
+          <p class="preset-note" id="aoi-note"></p>
+
+          <div class="field-label">
+            <label for="principal">Principal</label>
+            <span class="meta">claims from the token</span>
+          </div>
+          <textarea id="principal" spellcheck="false"></textarea>
+          <div class="diag ok" id="principal-diag"></div>
+        </div>
+      </section>
+    </div>
+
+    <div class="main">
+
+      <section class="panel">
+        <header>
+          <h2>Read alignment</h2>
+          <span class="meta">applies to both readers</span>
+        </header>
+        <div class="body">
+          <div class="toggle" role="radiogroup" aria-label="Read alignment">
+            <button type="button" role="radio" id="mode-coalesced" aria-checked="true">
+              Library defaults
+              <span>hyparquet: no projection · geotiff: 64 KB blocks</span>
+            </button>
+            <button type="button" role="radio" id="mode-aligned" aria-checked="false">
+              Boundary-aligned
+              <span>hyparquet: columns[] · geotiff: no blocking</span>
+            </button>
+          </div>
+          <p class="preset-note">
+            Both readers coalesce by default, and both can be made to fetch one exact structure
+            per request. Nothing else changes between the two positions: same policy, same
+            principal, same query, same files.
+          </p>
+        </div>
+      </section>
+
+      <section class="panel" id="parquet-panel">
+        <header>
+          <h2>Parquet · 8 row groups × 19 columns</h2>
+          <span class="meta" id="parquet-meta">nyc-taxi-8rg.parquet</span>
+        </header>
+        <div class="body">
+          <p class="preset-note" id="parquet-query"></p>
+          <div class="controls">
+            <button type="button" class="go" id="parquet-run">Run the query</button>
+            <button type="button" id="parquet-both">Run both modes</button>
+            <span class="busy" id="parquet-busy"></span>
+          </div>
+          <div class="scores" id="parquet-scores"></div>
+          <div class="strip-wrap" id="parquet-strip"></div>
+          <div class="grid-block" id="parquet-grid"></div>
+          <div class="legend">
+            <span><i class="a"></i>allowed by policy</span>
+            <span><i class="d"></i>denied by policy</span>
+            <span><i class="t"></i>read, served</span>
+            <span><i class="b"></i>read, refused</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="cog-panel">
+        <header>
+          <h2>Cloud-optimized GeoTIFF · 6 levels, 655 tiles</h2>
+          <span class="meta" id="cog-meta">s2-tci-512.tif</span>
+        </header>
+        <div class="body">
+          <p class="preset-note" id="cog-query"></p>
+          <div class="controls">
+            <label for="cog-level">Overview level</label>
+            <select id="cog-level"></select>
+            <button type="button" class="go" id="cog-run">Read the area</button>
+            <button type="button" id="cog-both">Run both modes</button>
+            <span class="busy" id="cog-busy"></span>
+          </div>
+          <p class="preset-note" id="cog-area"></p>
+          <div class="scores" id="cog-scores"></div>
+          <div class="preview" id="cog-preview" hidden>
+            <canvas id="cog-canvas" width="128" height="128"></canvas>
+            <div id="cog-preview-note"></div>
+          </div>
+          <div class="strip-wrap" id="cog-strip"></div>
+          <div class="grid-block" id="cog-grid"></div>
+          <div class="legend">
+            <span><i class="a"></i>allowed by policy</span>
+            <span><i class="d"></i>denied by policy</span>
+            <span><i class="t"></i>read, served</span>
+            <span><i class="b"></i>read, refused</span>
+            <span>dashed outline: licensed area</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <header>
+          <h2>Request log</h2>
+          <span class="meta" id="log-which">nothing run yet</span>
+        </header>
+        <div class="body">
+          <div class="log-scroll" id="log"></div>
+        </div>
+      </section>
+
+      <p class="note">
+        <strong>This page enforces nothing.</strong> The policy, the principal and the
+        interception all run in your browser, and both sample files are readable with
+        <code>curl</code> straight off this origin. It visualizes a decision; it is not an
+        enforcement point. The same Rust crate compiled to a gateway would be.
+      </p>
+
+    </div>
+  </div>
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

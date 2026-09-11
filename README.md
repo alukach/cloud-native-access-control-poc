@@ -6,9 +6,10 @@ A proof of concept for column-level and area-level access control over
 Parquet, COG, Zarr and Icechunk — enforced at an S3 gateway, using
 [CQL2](https://docs.ogc.org/is/21-065r2/21-065r2.html) as the rule language.
 
-> **Status: the Rust crate works; the browser demo is being built.**
-> Both resolvers parse real files, policies evaluate, and the decision
-> function is covered by 140 tests. This repository exists to decide whether
+> **Status: the crate works and the browser demo runs.**
+> Both resolvers parse real files, policies evaluate, the decision function is
+> covered by 140 tests, and the demo drives hyparquet and geotiff.js against
+> the sample files over real range requests. This repository exists to decide whether
 > [multistore](https://github.com/developmentseed/multistore) should adopt the
 > approach — it is not production software and enforces nothing today.
 > See the [design](docs/plans/2026-09-10-cloud-native-access-control-design.md)
@@ -177,6 +178,19 @@ npx serve .                        # from the repository root
 
 Serve from the repository root, not from `web/` — the page reads the sample
 files in `data/`.
+
+The page's subject is a single toggle. Both readers are run twice over the same
+policy, principal and query, once at their library defaults and once configured
+to fetch one structure per request, and the counters for both positions stay on
+screen: ranges issued, ranges straddling a policy boundary, bytes fetched, and
+whether the query completed. Measured here against the sample files:
+
+| | ranges | straddling | bytes | outcome |
+| --- | ---: | ---: | ---: | --- |
+| Parquet, library defaults | 10 | 8 | 15.9 kB | refused at the first row group |
+| Parquet, boundary-aligned | 34 | 0 | 1.41 MB | 400,000 rows |
+| COG, library defaults | 3 | 2 | 65.5 kB | refused at the first tile block |
+| COG, boundary-aligned | 13 | 0 | 351 kB | 1000×1000 px at full resolution |
 
 > **Do not use `python3 -m http.server`.** It ignores `Range` entirely and
 > answers `200` with the whole file (measured: a request for 20 bytes returns
