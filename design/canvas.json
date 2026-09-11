@@ -1,13 +1,53 @@
 {
   "artboards": [
-    { "file": "Current.dc.html", "x": 0, "y": 0, "w": 1200, "h": 880, "title": "Today" },
-    { "file": "Main.dc.html", "x": 1320, "y": 0, "w": 1440, "h": 980, "title": "Workbench" }
+    {
+      "file": "Current.dc.html",
+      "x": 0,
+      "y": 0,
+      "w": 1200,
+      "h": 880,
+      "title": "Today"
+    },
+    {
+      "file": "Main.dc.html",
+      "x": 1320,
+      "y": 0,
+      "w": 1440,
+      "h": 1080,
+      "title": "Workbench"
+    }
   ],
   "annotations": [
-    { "id": "brief", "x": 0, "y": -250, "w": 600, "text": "Third pass. Two changes since last time.\n\n1 — The query is now something you build. A row of column chips is the SELECT clause; picking them is how you decide what the reader fetches. Previously the four columns were hardcoded in presets.js and there was no way to change them, which is why \"the reader asked for this file in 10 requests\" came out of nowhere.\n\n2 — The toggle is gone. It implied alignment is a setting. It is a property of the client, so the readers are now rows on one axis and you see all of them at once." },
-    { "id": "flow", "x": 1320, "y": -180, "w": 430, "text": "The page reads as three numbered steps:\n\n1 what you ask for  (the query)\n2 what you may read  (policy + principal)\n3 what each reader actually fetched\n\nThat ordering is the argument. Steps 1 and 2 are independent; step 3 is what falls out of them, and the client is the variable nobody controls." },
-    { "id": "duck", "x": 1800, "y": -180, "w": 400, "text": "The DuckDB row is drawn as pending on purpose — I do not yet know if its range requests can be intercepted from JS, since it fetches from inside WASM. That is being measured now.\n\nIf it cannot be intercepted, the row comes out and the axis is two hyparquet configurations. If it can, this becomes the most useful line on the page: DuckDB is what people actually point at Parquet." },
-    { "id": "open", "x": 1320, "y": 1050, "w": 560, "text": "Open, and worth your call:\n\n• The column chips double as the projection control. Picking columns IS what makes hyparquet align. So \"query\" and \"fetch plan\" are the same knob for that reader — honest, but it means the second row is not a setting you toggle, it is what happens when a reader honours your projection.\n\n• The COG side needs the same treatment: AOI drawn on the tile grid instead of three preset buttons, and the same reader-rows picture with tiles instead of chunks. Not drawn yet.\n\n• Row count is a slider here. It may not earn its space — projection is what moves the numbers, rows barely do." }
+    {
+      "id": "brief",
+      "x": 0,
+      "y": -250,
+      "w": 600,
+      "text": "Fifth pass. The inputs were still too cramped in a 470px column, so they are not in a column any more.\n\nThe band runs the full width: the policy editor gets ~560px, enough that a CQL2 rule with an S_INTERSECTS polygon sits on one line instead of wrapping four times. The query chips and the principal get real room beside it.\n\nIt collapses to a one-line summary once set, so the scroll cost you pay for the width is only paid while you are editing."
+    },
+    {
+      "id": "matrix",
+      "x": 1320,
+      "y": -230,
+      "w": 470,
+      "text": "The matrix is the finding now.\n\nZero-fill is NOT universally safe, and that is the interesting part. It is lossless exactly when the reader never parses the blanked bytes:\n\n\u2022 DuckDB projects, so a zeroed chunk inside its 64 KiB block is never looked at \u2014 clean.\n\u2022 hyparquet without projection reads all 19 columns, so it parses the zeros and hands back garbage.\n\nSame gate, same policy, opposite outcome. That is a sharper statement than anything about range counts."
+    },
+    {
+      "id": "duck",
+      "x": 1850,
+      "y": -230,
+      "w": 420,
+      "text": "DuckDB, measured:\n\n\u2022 projection pushdown is real \u2014 2 of 19 columns fetched 11.9% of the object\n\u2022 row-group pruning is real \u2014 a WHERE clause read 2 of 8 row groups\n\u2022 and 27 of 27 content requests still straddle, because the reads are 64 KiB power-of-two blocks, not chunk extents\n\nDeny `extra`, ask for `fare_amount` \u2192 refused, because they are adjacent in the file. Deny `extra`, ask for `VendorID` \u2192 fine. Adjacency decides, not the query."
+    },
+    {
+      "id": "open",
+      "x": 1320,
+      "y": 1190,
+      "w": 560,
+      "text": "Open:\n\n\u2022 The collapse is the part I am least sure of. It buys full-width editing without a permanent scroll tax, but it adds a state the page can be in, and a collapsed band hides the thing a reader most needs to understand the results. Worth a look at whether it should start collapsed or expanded.\n\n\u2022 DuckDB zero-fill \"completes\" is still unverified \u2014 it assumes nothing validates page headers or CRCs inside unprojected chunks.\n\n\u2022 COG side still needs the same treatment.\n\n\u2022 Legend moved above the charts \u2014 it was at the foot of the reader panel, which meant the first chart on the page was unreadable until you had scrolled past it.\n\n\u2022 \"Run every reader\" said what it loops over, not what it does. It now reads \"Run this query / three readers, same policy, every range checked\" \u2014 the subject is the query you built in step 1, executed three times against the same file."
+    }
   ],
-  "launch": { "view": "canvas" }
+  "launch": {
+    "view": "canvas"
+  }
 }
