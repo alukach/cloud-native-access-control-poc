@@ -331,11 +331,10 @@ compressed, so no codec features are needed), `tiff 0.11`, `geo 0.33`,
 `cql2 0.6`, and `getrandom` as a **direct** dependency with the `wasm_js`
 feature — a transitive dependency cannot have that feature enabled.
 
-Bundle is **~1.4 MiB** once real symbols are exported (measured at Task 1 with
-a representative `S_INTERSECTS` export; an empty cdylib measures 312 bytes
-because LTO strips the whole graph, which is not a meaningful baseline). That
-is ~60% above the pre-implementation estimate of ~900 KB. Of it, **cql2 is the
-dominant share**: it has no
+Bundle measured at Task 9 with the real exported API: **1,071,351 bytes raw
+(1.02 MiB), 416,625 gzipped (407 KiB)**, plus 18.6 KB of JS glue. Under the
+~1.4 MiB pre-implementation estimate. `wasm-opt` needed no bulk-memory
+override. Of it, **cql2 is the dominant share**: it has no
 `[features]` section, so `sqlparser`, `jiff` + tzdb and `jsonschema` are all
 mandatory. Feature-gating them upstream is the only lever that matters, and
 nothing else we do to bundle size will show. Do not reuse the published
