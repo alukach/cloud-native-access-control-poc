@@ -41,6 +41,46 @@ export const AOIS = [
 
 export const aoiWkt = (aoi) => ring(aoi.bbox);
 
+/**
+ * The same three licensed areas over somebody else's image.
+ *
+ * The bundled polygons are hand-placed over the land in one Sentinel granule,
+ * in that granule's CRS. A file loaded from a URL has neither, so the areas
+ * are re-cut as fractions of its own extent: a licence covering a tenth of the
+ * scene by side, a twentieth, and all of it. Same shapes, same lesson, no
+ * assumption about where anything is.
+ */
+export function aoisFor(extent) {
+  const [x0, y0, x1, y1] = extent;
+  const cx = (x0 + x1) / 2;
+  const cy = (y0 + y1) / 2;
+  const box = (fraction) => {
+    const w = ((x1 - x0) * fraction) / 2;
+    const h = ((y1 - y0) * fraction) / 2;
+    return [cx - w, cy - h, cx + w, cy + h];
+  };
+  return [
+    {
+      id: 'coast',
+      name: 'Middle tenth',
+      note: 'A licence over the centre tenth of this image, by side. Whatever the reader blocks its reads into, that block is fixed and this boundary is not, so the two disagree at the edges.',
+      bbox: box(0.1),
+    },
+    {
+      id: 'headland',
+      name: 'Middle twentieth',
+      note: 'Half the width for the same fixed block size, so the reader overshoots the licence proportionally further.',
+      bbox: box(0.05),
+    },
+    {
+      id: 'scene',
+      name: 'Whole scene',
+      note: 'Licensing the entire image. Every tile is inside the area, so nothing straddles and the only limit left is how much a browser will decode at once.',
+      bbox: [x0, y0, x1, y1],
+    },
+  ];
+}
+
 /** The columns the Parquet query asks for. */
 export const QUERY_COLUMNS = [
   'VendorID',
@@ -58,11 +98,24 @@ export const PRINCIPAL = JSON.stringify(
 const policy = (lines) => `allow:\n${lines.map((l) => `  - "${l}"`).join('\n')}\n`;
 
 const METADATA = "region.kind = 'metadata'";
-const COLUMN_MASK =
-  "region.kind = 'column_chunk' AND region.column NOT IN ('tip_amount', 'total_amount')";
+/** The two columns the bundled Parquet withholds, and the default for any file. */
+export const WITHHELD = ['tip_amount', 'total_amount'];
+const COLUMN_MASK = (withheld) =>
+  `region.kind = 'column_chunk' AND region.column NOT IN (${
+    withheld.map((c) => `'${c}'`).join(', ')
+  })`;
 const OVERVIEWS = "region.kind = 'tile' AND region.overview_level >= 2";
 const AOI_RULE = (wkt) =>
   `user.role = 'analyst' AND region.kind = 'tile' AND S_INTERSECTS(region.geom, ${wkt})`;
+
+/**
+ * A preset is built against one file's vocabulary.
+ *
+ * `wkt` is the licensed area and `withheld` the columns the mask holds back.
+ * Both default to the bundled files' own, so a page with nothing loaded from a
+ * URL writes exactly the documents it always did.
+ */
+const context = (ctx) => ({ wkt: aoiWkt(AOIS[0]), withheld: WITHHELD, ...ctx });
 
 export const POLICY_PRESETS = [
   {
@@ -70,7 +123,10 @@ export const POLICY_PRESETS = [
     name: 'Column mask and licensed area',
     blurb:
       'The realistic case. Two fare columns withheld, overviews public, full resolution inside the licensed area.',
-    build: (wkt) => policy([METADATA, COLUMN_MASK, OVERVIEWS, AOI_RULE(wkt)]),
+    build: (ctx) => {
+      const { wkt, withheld } = context(ctx);
+      return policy([METADATA, COLUMN_MASK(withheld), OVERVIEWS, AOI_RULE(wkt)]);
+    },
   },
   {
     id: 'open',

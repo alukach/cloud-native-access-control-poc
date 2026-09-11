@@ -5,6 +5,7 @@ import {
   BLOCK_SIZE,
   Policy,
   buildIndex,
+  isCrossOrigin,
   makeGate,
   probe,
   queryables,
@@ -19,20 +20,51 @@ import {
   PRINCIPAL,
   QUERY_COLUMNS,
   SCENE_EXTENT,
+  WITHHELD,
   aoiBboxFrom,
   aoiWkt,
+  aoisFor,
   substituteAoi,
 } from './presets.js';
+import {
+  EXAMPLES,
+  FORMATS,
+  NOT_YET,
+  SAMPLES,
+  SourceError,
+  detect,
+  formatName,
+} from './source.js';
+import { debounce, pack, unpack, writeQuery } from './share.js';
 
-const DATA = {
-  parquet: '../data/nyc-taxi-8rg.parquet',
-  cog: '../data/s2-tci-512.tif',
-};
+/** The two files the page ships with, and the only ones it hardcodes prose about. */
+const SAMPLE_FILES = [
+  {
+    key: 'parquet',
+    format: 'parquet',
+    url: '../data/nyc-taxi-8rg.parquet',
+    label: 'nyc-taxi-8rg.parquet',
+    rowsLabel: 'all 400,000 rows',
+  },
+  {
+    key: 'cog',
+    format: 'cog',
+    url: '../data/s2-tci-512.tif',
+    label: 's2-tci-512.tif',
+  },
+];
+
+/** A file loaded from a URL could have a hundred million rows. This many, then. */
+const CUSTOM_ROW_CAP = 100000;
 
 const MODES = [
   { id: 'coalesced', name: 'Library defaults', hint: 'coalesced' },
   { id: 'aligned', name: 'Boundary-aligned', hint: 'one structure per range' },
 ];
+
+/** The disclosures whose open/closed state travels in the link. */
+const PANELS = ['source', 'log'];
+const PANELS_DEFAULT = 'log,source';
 
 const $ = (id) => document.getElementById(id);
 
@@ -45,6 +77,13 @@ const state = {
   userError: null,
   lastLog: null,
   files: {},
+  // `mode` is SAMPLES or 'custom'. `format` is the override, 'auto' or a
+  // format id -- what the *user* said, kept apart from what the URL implies.
+  source: { mode: SAMPLES, url: '', format: 'auto' },
+  preset: POLICY_PRESETS[0].id,
+  aoi: AOIS[0].id,
+  panels: new Set(PANELS),
+  booting: true,
 };
 
 // A denial inside geotiff.js's blocked source leaves sibling block promises
@@ -70,6 +109,7 @@ const regionLabel = (r) => {
     case 'bloom_filter': return `bloom·${r.column}`;
     case 'column_index': return `pageindex·${r.column}`;
     case 'tile': return `L${r.overview_level} (${r.x},${r.y})`;
+    case 'unmapped': return `unmapped ${r.start}–${r.end - 1}`;
     default: return r.kind;
   }
 };
@@ -87,6 +127,152 @@ function deniedNames(file, indices) {
   if (!names.length) return '';
   const shown = names.slice(0, 3).join(', ');
   return names.length > 3 ? `${shown} and ${names.length - 3} more` : shown;
+}
+
+/**
+ * The bytes the resolver could not attribute to anything.
+ *
+ * `LayoutIndex` fills every gap so that coverage of the object is total, and
+ * those fillers are their own kind on purpose -- if they classified as
+ * metadata, the `region.kind = 'metadata'` rule everybody writes would become
+ * a wildcard over exactly the bytes the resolver understood least. The
+ * consequence is that a file with a gap in its header denies the first read a
+ * reader makes, which is a surprise worth spending a sentence on rather than
+ * leaving the reader to find "denied by unmapped" in the log.
+ */
+function unmappedNote(regions) {
+  const spans = regions.filter((r) => r.kind === 'unmapped');
+  if (!spans.length) return '';
+  const total = spans.reduce((sum, r) => sum + (r.end - r.start), 0);
+  return `\n\n${spans.length} span${spans.length === 1 ? '' : 's'} of it, ${bytes(total)} in all, `
+    + 'came back as kind "unmapped" — bytes no resolver rule could attribute to a structure. '
+    + 'Coverage of the object is total by construction, so they are in the index, and none of the '
+    + 'presets names that kind: a rule that did would be granting precisely the bytes least '
+    + 'understood. Any range crossing one is refused, and in a file whose header has a gap that '
+    + 'is the very first read.';
+}
+
+/** Build an element with text in it. Never markup: most of this is file-derived. */
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+// ---- the file's own vocabulary ------------------------------------------
+//
+// The presets are written against the bundled files: four taxi columns to
+// select, two to withhold, three polygons over one Sentinel granule. None of
+// that survives contact with somebody else's object, so each of them falls
+// back to the loaded file's own columns and its own extent -- and returns the
+// hardcoded answer whenever the loaded file is in fact the bundled one, so a
+// page with nothing in its query string writes exactly the document it always
+// wrote.
+
+function fileColumns() {
+  const file = state.files.parquet;
+  if (!file?.regions) return null;
+  const columns = [...new Set(
+    file.regions.filter((r) => r.kind === 'column_chunk').map((r) => r.column),
+  )];
+  return columns.length ? columns : null;
+}
+
+function withheldColumns() {
+  const columns = fileColumns();
+  if (!columns || WITHHELD.every((c) => columns.includes(c))) return WITHHELD;
+  return columns.slice(-Math.min(2, Math.max(1, columns.length - 1)));
+}
+
+function queryColumns() {
+  const columns = fileColumns();
+  if (!columns || QUERY_COLUMNS.every((c) => columns.includes(c))) return QUERY_COLUMNS;
+  const withheld = withheldColumns();
+  const open = columns.filter((c) => !withheld.includes(c));
+  return (open.length ? open : columns).slice(0, 4);
+}
+
+/** The union of every tile bbox: the image's own extent, in its own CRS. */
+function extentOf(regions) {
+  const boxes = regions
+    .filter((r) => r.kind === 'tile' && Array.isArray(r.bbox) && r.bbox.length === 4)
+    .map((r) => r.bbox);
+  if (!boxes.length) return null;
+  return [
+    Math.min(...boxes.map((b) => b[0])),
+    Math.min(...boxes.map((b) => b[1])),
+    Math.max(...boxes.map((b) => b[2])),
+    Math.max(...boxes.map((b) => b[3])),
+  ];
+}
+
+const sceneExtent = () => state.files.cog?.extent || SCENE_EXTENT;
+
+const currentAois = () =>
+  (state.source.mode === SAMPLES || !state.files.cog ? AOIS : aoisFor(sceneExtent()));
+
+function pickedAoi() {
+  const aois = currentAois();
+  return aois.find((a) => a.id === state.aoi) || aois[0];
+}
+
+// ---- the link -----------------------------------------------------------
+//
+// Read once on load, rewritten on every change. `replaceState`, so the back
+// button still goes back to wherever the reader came from rather than to the
+// previous keystroke.
+
+const DEFAULT_POLICY = POLICY_PRESETS[0].build({});
+
+async function writeUrl() {
+  if (state.booting) return;
+  const params = new URLSearchParams();
+  if ((state.source.mode !== SAMPLES || state.source.failed) && state.source.url) {
+    params.set('file', state.source.url);
+    if (state.source.format !== 'auto') params.set('fmt', state.source.format);
+  }
+  if (state.preset !== POLICY_PRESETS[0].id) params.set('preset', state.preset);
+  if (state.aoi !== AOIS[0].id) params.set('aoi', state.aoi);
+  if ($('policy').value !== DEFAULT_POLICY) params.set('p', await pack($('policy').value));
+  if ($('principal').value !== PRINCIPAL) params.set('u', await pack($('principal').value));
+  if (state.mode !== 'coalesced') params.set('m', state.mode);
+  const level = $('cog-level').value;
+  if (level && level !== '0') params.set('lvl', level);
+  const panels = [...state.panels].sort().join(',');
+  if (panels !== PANELS_DEFAULT) params.set('panel', panels);
+  writeQuery(params);
+}
+
+const writeUrlSoon = debounce(writeUrl, 400);
+
+function copyNote(text, ok = true) {
+  const note = $('copy-note');
+  note.textContent = text;
+  note.style.color = ok ? '' : 'var(--deny)';
+  setTimeout(() => { note.textContent = ''; }, 4000);
+}
+
+async function copyLink() {
+  await writeUrl();
+  try {
+    await navigator.clipboard.writeText(location.href);
+    copyNote(`copied · ${location.href.length} characters`);
+  } catch {
+    // A page served over plain http, or a browser that wants a gesture it did
+    // not see. Select it instead; the reader can still press the shortcut.
+    const field = el('input');
+    field.value = location.href;
+    field.style.cssText = 'position:fixed;opacity:0';
+    document.body.append(field);
+    field.select();
+    const worked = document.execCommand?.('copy');
+    field.remove();
+    copyNote(
+      worked ? `copied · ${location.href.length} characters` : 'copy it from the address bar',
+      Boolean(worked),
+    );
+  }
 }
 
 // ---- policy -------------------------------------------------------------
@@ -145,7 +331,9 @@ function refreshVerdicts() {
   }
   for (const key of Object.keys(state.files)) paintScores(key);
   renderLog();
-  for (const button of document.querySelectorAll('.go')) button.disabled = !usable;
+  for (const button of document.querySelectorAll('.go')) {
+    if (button.id !== 'source-load') button.disabled = !usable;
+  }
 }
 
 // ---- grids --------------------------------------------------------------
@@ -159,6 +347,12 @@ function cellFor(file, i) {
   return cell;
 }
 
+function gridTitle(heading, detail) {
+  const title = el('div', 'grid-title');
+  title.append(el('b', '', heading), el('span', '', detail));
+  return title;
+}
+
 function buildParquetGrid(file) {
   const host = $('parquet-grid');
   host.textContent = '';
@@ -169,30 +363,20 @@ function buildParquetGrid(file) {
   const groups = [...new Set(chunks.map((r) => r.row_group))].sort((a, b) => a - b);
   const byKey = new Map(chunks.map((r) => [`${r.row_group}/${r.column}`, r.i]));
 
-  const title = document.createElement('div');
-  title.className = 'grid-title';
-  title.innerHTML = `<b>Column chunks</b><span>${groups.length} row groups × ${columns.length} columns</span>`;
-  host.append(title);
+  host.append(gridTitle('Column chunks', `${groups.length} row groups × ${columns.length} columns`));
 
-  const scroll = document.createElement('div');
-  scroll.className = 'grid-scroll';
-  const grid = document.createElement('div');
-  grid.className = 'pq';
+  const scroll = el('div', 'grid-scroll');
+  const grid = el('div', 'pq');
   grid.style.gridTemplateColumns = `auto repeat(${columns.length}, 1.375rem)`;
 
   grid.append(document.createElement('div'));
   for (const column of columns) {
-    const head = document.createElement('div');
-    head.className = 'head';
-    head.textContent = column;
+    const head = el('div', 'head', column);
     head.dataset.column = column;
     grid.append(head);
   }
   for (const group of groups) {
-    const label = document.createElement('div');
-    label.className = 'rowlab';
-    label.textContent = `rg ${group}`;
-    grid.append(label);
+    grid.append(el('div', 'rowlab', `rg ${group}`));
     for (const column of columns) grid.append(cellFor(file, byKey.get(`${group}/${column}`)));
   }
   scroll.append(grid);
@@ -202,28 +386,26 @@ function buildParquetGrid(file) {
 
   const blooms = file.regions.filter((r) => r.kind === 'bloom_filter');
   if (blooms.length) {
-    const note = document.createElement('p');
-    note.className = 'preset-note';
+    const note = el('p', 'preset-note');
     note.id = 'parquet-bloom-note';
     note.dataset.count = String(blooms.length);
     host.append(note);
   }
   file.columnHeads = grid.querySelectorAll('.head');
+  file.columns = columns;
+  file.rowGroups = groups.length;
 }
 
 function metadataBlock(file, heading, predicate) {
-  const block = document.createElement('div');
-  block.className = 'grid-block';
+  const block = el('div', 'grid-block');
   const regions = file.regions.filter(predicate);
-  const title = document.createElement('div');
-  title.className = 'grid-title';
-  title.innerHTML = `<b>${heading}</b><span>${regions.length} regions · the reader needs these to find anything else</span>`;
-  block.append(title);
+  block.append(gridTitle(
+    heading,
+    `${regions.length} regions · the reader needs these to find anything else`,
+  ));
 
-  const scroll = document.createElement('div');
-  scroll.className = 'grid-scroll';
-  const grid = document.createElement('div');
-  grid.className = 'pq';
+  const scroll = el('div', 'grid-scroll');
+  const grid = el('div', 'pq');
   grid.style.gridTemplateColumns = `repeat(${regions.length}, 1.375rem)`;
   for (const r of regions) grid.append(cellFor(file, r.i));
   scroll.append(grid);
@@ -239,13 +421,9 @@ function buildCogGrid(file) {
   const tiles = file.regions.filter((r) => r.kind === 'tile');
   const levels = [...new Set(tiles.map((r) => r.overview_level))].sort((a, b) => a - b);
 
-  const title = document.createElement('div');
-  title.className = 'grid-title';
-  title.innerHTML = `<b>Tiles</b><span>${tiles.length} across ${levels.length} overview levels</span>`;
-  host.append(title);
+  host.append(gridTitle('Tiles', `${tiles.length} across ${levels.length} overview levels`));
 
-  const wrap = document.createElement('div');
-  wrap.className = 'levels';
+  const wrap = el('div', 'levels');
   file.levels = [];
 
   for (const level of levels) {
@@ -254,22 +432,16 @@ function buildCogGrid(file) {
     const rows = Math.max(...own.map((r) => r.y)) + 1;
     const byKey = new Map(own.map((r) => [`${r.x}/${r.y}`, r.i]));
 
-    const box = document.createElement('div');
-    box.className = 'level';
-    const label = document.createElement('div');
-    label.className = 'grid-title';
-    label.innerHTML = `<b>L${level}</b><span>${cols}×${rows}</span>`;
-    box.append(label);
+    const box = el('div', 'level');
+    box.append(gridTitle(`L${level}`, `${cols}×${rows}`));
 
-    const board = document.createElement('div');
-    board.className = 'board';
+    const board = el('div', 'board');
     const side = Math.max(6, Math.min(18, Math.round(160 / cols)));
     board.style.gridTemplateColumns = `repeat(${cols}, ${side}px)`;
     for (let y = 0; y < rows; y += 1) {
       for (let x = 0; x < cols; x += 1) board.append(cellFor(file, byKey.get(`${x}/${y}`)));
     }
-    const aoi = document.createElement('div');
-    aoi.className = 'aoi';
+    const aoi = el('div', 'aoi');
     board.append(aoi);
     box.append(board);
     wrap.append(box);
@@ -290,7 +462,7 @@ function paintAoi() {
   }
   const file = state.files.cog;
   if (!file?.levels) return;
-  const [ex0, ey0, ex1, ey1] = SCENE_EXTENT;
+  const [ex0, ey0, ex1, ey1] = sceneExtent();
   for (const level of file.levels) {
     if (!bbox) { level.aoi.hidden = true; continue; }
     level.aoi.hidden = false;
@@ -339,15 +511,16 @@ function paintStrip(file) {
   const host = $(`${file.key}-strip`);
   host.textContent = '';
 
-  const head = document.createElement('div');
-  head.className = 'strip-head';
-  head.innerHTML = `<span>byte 0</span><span>the whole object, ${bytes(file.size)}, coloured by verdict</span><span>${file.size}</span>`;
+  const head = el('div', 'strip-head');
+  head.append(
+    el('span', '', 'byte 0'),
+    el('span', '', `the whole object, ${bytes(file.size)}, coloured by verdict`),
+    el('span', '', String(file.size)),
+  );
   host.append(head);
 
-  const strip = document.createElement('div');
-  strip.className = 'strip';
-  const bands = document.createElement('div');
-  bands.className = 'bands';
+  const strip = el('div', 'strip');
+  const bands = el('div', 'bands');
 
   const stops = [];
   let colour = null;
@@ -366,8 +539,7 @@ function paintStrip(file) {
   bands.style.background = `linear-gradient(to right, ${stops.join(',')})`;
   strip.append(bands);
 
-  const hits = document.createElement('div');
-  hits.className = 'hits';
+  const hits = el('div', 'hits');
   hits.id = `${file.key}-hits`;
   strip.append(hits);
   host.append(strip);
@@ -379,8 +551,7 @@ function paintStrip(file) {
 function markHit(file, entry) {
   const hits = $(`${file.key}-hits`);
   if (!hits) return;
-  const mark = document.createElement('div');
-  mark.className = entry.allowed ? 'hit' : 'hit no';
+  const mark = el('div', entry.allowed ? 'hit' : 'hit no');
   mark.style.left = `${(entry.start / file.size) * 100}%`;
   mark.style.width = `${Math.max(0.15, (entry.length / file.size) * 100)}%`;
   mark.title = `#${entry.n} bytes=${entry.start}-${entry.end - 1}`;
@@ -395,22 +566,17 @@ function paintScores(key) {
   host.textContent = '';
   for (const mode of MODES) {
     const run = file.runs?.[mode.id];
-    const box = document.createElement('div');
-    box.className = `score${mode.id === state.mode ? ' live' : ''}`;
+    const box = el('div', `score${mode.id === state.mode ? ' live' : ''}`);
 
-    const heading = document.createElement('h3');
-    heading.innerHTML = `${mode.name}<em>${mode.hint}</em>`;
+    const heading = el('h3', '', mode.name);
+    heading.append(el('em', '', mode.hint));
     box.append(heading);
 
     const dl = document.createElement('dl');
     const row = (term, value, cls = '', why = '') => {
-      const dt = document.createElement('dt');
-      dt.textContent = term;
+      const dt = el('dt', '', term);
       if (why) dt.title = why;
-      const dd = document.createElement('dd');
-      dd.className = cls;
-      dd.innerHTML = value;
-      dl.append(dt, dd);
+      dl.append(dt, el('dd', cls, value));
     };
     row(
       'Ranges issued',
@@ -432,16 +598,17 @@ function paintScores(key) {
     );
     box.append(dl);
 
-    const outcome = document.createElement('div');
+    // `run.detail` quotes region names out of the file, so it is set as text.
+    const outcome = el('div');
     if (!run) {
       outcome.className = 'outcome idle';
       outcome.textContent = 'not run yet';
-    } else if (run.ok) {
-      outcome.className = 'outcome ok';
-      outcome.innerHTML = `<b>QUERY COMPLETED</b><span>${run.detail}</span>`;
     } else {
-      outcome.className = 'outcome no';
-      outcome.innerHTML = `<b>QUERY FAILED</b><span>${run.detail}</span>`;
+      outcome.className = `outcome ${run.ok ? 'ok' : 'no'}`;
+      outcome.append(
+        el('b', '', run.ok ? 'QUERY COMPLETED' : 'QUERY FAILED'),
+        el('span', '', run.detail),
+      );
     }
     box.append(outcome);
     host.append(box);
@@ -458,15 +625,20 @@ function renderLog() {
   const run = file?.runs?.[which.mode];
   if (!run) {
     $('log-which').textContent = 'nothing run yet';
-    host.innerHTML = '<div class="log-empty">Run a query to see every range it asked for.</div>';
+    host.append(el('div', 'log-empty', 'Run a query to see every range it asked for.'));
     return;
   }
   $('log-which').textContent = `${which.key} · ${MODES.find((m) => m.id === which.mode).name} · ${run.log.length} ranges`;
 
-  const table = document.createElement('table');
-  table.className = 'log';
-  table.innerHTML =
-    '<thead><tr><th>#</th><th>range</th><th class="r">bytes</th><th>resolved to</th><th class="v">verdict</th><th>why</th></tr></thead>';
+  const table = el('table', 'log');
+  const headRow = document.createElement('tr');
+  for (const [label, cls] of [['#', ''], ['range', ''], ['bytes', 'r'], ['resolved to', ''], ['verdict', 'v'], ['why', '']]) {
+    headRow.append(el('th', cls, label));
+  }
+  const thead = document.createElement('thead');
+  thead.append(headRow);
+  table.append(thead);
+
   const body = document.createElement('tbody');
   for (const entry of run.log) {
     const tr = document.createElement('tr');
@@ -479,13 +651,14 @@ function renderLog() {
       : entry.reason === 'bad_range'
         ? 'the range did not parse'
         : `denied by ${deniedNames(file, entry.regions)}`;
-    tr.innerHTML = `
-      <td class="n">${entry.n}</td>
-      <td>${entry.start}–${entry.end - 1}</td>
-      <td class="r">${bytes(entry.length)}</td>
-      <td>${summarise(file, entry.regions)}</td>
-      <td class="v">${entry.allowed ? 'allow' : 'DENY'}${entry.straddles ? ' · straddles' : ''}</td>
-      <td class="why">${why}</td>`;
+    tr.append(
+      el('td', 'n', String(entry.n)),
+      el('td', '', `${entry.start}–${entry.end - 1}`),
+      el('td', 'r', bytes(entry.length)),
+      el('td', '', summarise(file, entry.regions)),
+      el('td', 'v', `${entry.allowed ? 'allow' : 'DENY'}${entry.straddles ? ' · straddles' : ''}`),
+      el('td', 'why', why),
+    );
     body.append(tr);
   }
   table.append(body);
@@ -540,19 +713,21 @@ async function runOne(key, mode) {
   let detail = '';
   try {
     if (key === 'parquet') {
+      const columns = file.queryColumns;
       const { rows } = await runParquet({
         gate,
         size: file.size,
-        columns: QUERY_COLUMNS,
+        columns,
         aligned: mode === 'aligned',
+        rowEnd: file.rowEnd,
       });
       ok = true;
       detail = `${rows.toLocaleString()} rows decoded from ${
-        mode === 'aligned' ? `${QUERY_COLUMNS.length} projected columns` : 'all 19 columns'
+        mode === 'aligned' ? `${columns.length} projected columns` : `all ${file.columns.length} columns`
       }`;
     } else {
       const level = Number($('cog-level').value);
-      const bbox = aoiBboxFrom(state.policyText) || SCENE_EXTENT;
+      const bbox = aoiBboxFrom(state.policyText) || sceneExtent();
       const result = await runCog({
         gate,
         size: file.size,
@@ -613,6 +788,223 @@ function drawPreview(result, level) {
   $('cog-preview-note').textContent = `level ${level}, ${width}×${height} pixels, decoded in the browser from the tiles the policy allowed`;
 }
 
+// ---- loading a file -----------------------------------------------------
+
+/**
+ * Probe, index and describe one object, touching nothing on the page.
+ *
+ * Nothing is swapped in until every file in the set has survived this, so a
+ * URL that turns out to be CORS-blocked leaves the previous file loaded and
+ * the reader looking at a diagnostic rather than at an empty page.
+ */
+async function prepare(spec, strict) {
+  const info = await probe(spec.url, { strict });
+  const { index, window } = await buildIndex(spec.format, spec.url, info.size);
+  return { spec, info, index, window, regions: JSON.parse(index.regions()) };
+}
+
+function commit(prepared) {
+  for (const file of Object.values(state.files)) file.index?.free();
+  state.files = {};
+
+  const keys = prepared.map((p) => p.spec.key);
+  $('parquet-panel').hidden = !keys.includes('parquet');
+  $('cog-panel').hidden = !keys.includes('cog');
+  $('aoi-block').hidden = !keys.includes('cog');
+  $('cog-preview').hidden = true;
+  state.lastLog = null;
+
+  const hosting = [];
+  for (const { spec, info, index, window, regions } of prepared) {
+    const file = {
+      key: spec.key,
+      url: spec.url,
+      size: info.size,
+      index,
+      regions,
+      window,
+      cells: new Map(),
+      runs: {},
+    };
+    state.files[spec.key] = file;
+    hosting.push(
+      `${spec.key} ${info.rangeStatus}${info.servedWhole ? ' whole body' : ''}, ${info.contentEncoding}`,
+    );
+
+    if (spec.key === 'parquet') {
+      buildParquetGrid(file);
+      file.queryColumns = queryColumns();
+      file.rowEnd = spec.rowsLabel ? undefined : CUSTOM_ROW_CAP;
+      file.rowsLabel = spec.rowsLabel || `the first ${CUSTOM_ROW_CAP.toLocaleString()} rows`;
+      $('parquet-title').textContent =
+        `Parquet · ${file.rowGroups} row groups × ${file.columns.length} columns`;
+      $('parquet-meta').textContent =
+        `${spec.label} · ${bytes(info.size)} · ${index.regionCount} regions · footer read from the last ${bytes(window)}`;
+    } else {
+      buildCogGrid(file);
+      file.extent = extentOf(regions) || SCENE_EXTENT;
+      const tiles = file.levels.map((l) => l.tiles).reduce((a, b) => a + b, 0);
+      $('cog-title').textContent =
+        `Cloud-optimized GeoTIFF · ${file.levels.length} levels, ${tiles} tiles`;
+      $('cog-meta').textContent =
+        `${spec.label} · ${bytes(info.size)} · ${tiles} tiles · IFDs read from the first ${bytes(window)}`;
+      const select = $('cog-level');
+      select.textContent = '';
+      for (const l of file.levels) {
+        const option = el('option', '', `L${l.level} — ${l.tiles} tile${l.tiles === 1 ? '' : 's'}`);
+        option.value = String(l.level);
+        select.append(option);
+      }
+      select.value = '0';
+    }
+  }
+  $('hosting').textContent = hosting.join(' · ');
+  describeQueries();
+}
+
+function describeQueries() {
+  const pq = state.files.parquet;
+  if (pq) {
+    $('parquet-query').textContent =
+      `SELECT ${pq.queryColumns.join(', ')} — ${pq.rowsLabel}, all ${pq.rowGroups} row groups. `
+      + 'Boundary-aligned passes that column list to hyparquet; the default position does not pass one, '
+      + `so hyparquet reads every one of the ${pq.columns.length} columns and merges each row group `
+      + 'into a single request under its 2 MB run limit.';
+  }
+  if (state.files.cog) {
+    $('cog-query').textContent =
+      'Read the licensed area at one overview level. Boundary-aligned hands the policy source '
+      + 'straight to geotiff.js; the default position wraps it in the same '
+      + `${BLOCK_SIZE / 1024} KB blocking layer fromUrl installs, which aligns reads to blocks `
+      + 'rather than to tiles.';
+  }
+}
+
+// ---- the source panel ---------------------------------------------------
+
+function sourceDiag(kind, heading, detail, link) {
+  const diag = $('source-diag');
+  diag.className = `diag ${kind}`;
+  diag.textContent = '';
+  if (heading) diag.append(el('b', '', heading));
+  diag.append(document.createTextNode(detail));
+  if (link) {
+    diag.append(document.createTextNode('\n'));
+    const anchor = el('a', '', link.text);
+    anchor.href = link.href;
+    anchor.target = '_blank';
+    anchor.rel = 'noreferrer';
+    diag.append(anchor);
+  }
+}
+
+/** What the URL box says, judged but not fetched. Runs on every keystroke. */
+function describeDetection() {
+  const found = detect($('source-url').value);
+  const label = $('source-detected');
+  if (found.error) { label.textContent = found.error; return found; }
+  if (found.notYet) { label.textContent = `${NOT_YET[found.notYet].name}, from ${found.from}`; return found; }
+  const override = $('source-format').value;
+  if (override !== 'auto') {
+    label.textContent = `${formatName(override)}, because you said so`;
+  } else if (found.format) {
+    label.textContent = `${formatName(found.format)}, from ${found.from}`;
+  } else {
+    label.textContent = 'format unknown';
+  }
+  return found;
+}
+
+async function loadCustom(url, { announce = true } = {}) {
+  const found = detect(url);
+  const override = $('source-format').value;
+
+  if (found.error) {
+    sourceDiag('bad', '', found.error);
+    return false;
+  }
+  if (found.notYet && override === 'auto') {
+    const { name, issue, why } = NOT_YET[found.notYet];
+    sourceDiag(
+      'bad',
+      `${name} is not implemented yet.`,
+      `Detected from ${found.from}, so this is a specific answer rather than a parse failure. `
+      + `${why}\n\nTracking issue: `,
+      { href: issue, text: issue },
+    );
+    return false;
+  }
+  const format = override === 'auto' ? found.format : override;
+  if (!format) {
+    sourceDiag('bad', 'Cannot tell what this is.', found.hint || 'Choose the format below.');
+    return false;
+  }
+
+  const label = decodeURIComponent(new URL(url, location.href).pathname).split('/').filter(Boolean).pop() || url;
+  const spec = { key: format, format, url, label };
+
+  $('source-busy').textContent = 'probing…';
+  $('source-load').disabled = true;
+  try {
+    const prepared = await prepare(spec, true);
+    commit([prepared]);
+    state.source = { mode: 'custom', url, format: override, failed: false };
+    setSourceMode('custom');
+    const ranged = prepared.info.rangeStatus === 206;
+    sourceDiag(
+      'ok',
+      `Loaded ${label} as ${formatName(format)}.`,
+      `${bytes(prepared.info.size)}, ${prepared.info.crossOrigin ? 'cross-origin' : 'same-origin'}, `
+      + `${ranged ? '206 Partial Content' : `${prepared.info.rangeStatus} on the probe`}. `
+      + `The layout index came out of the ${format === 'parquet' ? 'last' : 'first'} `
+      + `${bytes(prepared.window)}: ${prepared.index.regionCount} regions.`
+      + unmappedNote(prepared.regions),
+    );
+    refreshVerdicts();
+    if (announce) await writeUrl();
+    return true;
+  } catch (err) {
+    if (err instanceof SourceError) {
+      sourceDiag(err.kind === 'range-ignored' ? 'loud' : 'bad', `${err.message}`, err.detail);
+    } else {
+      sourceDiag(
+        'bad',
+        'The bytes arrived and did not parse.',
+        `${String(err?.message || err)}\n\nThe host serves ranges, so this is about the file, not `
+        + 'the transport. Check that the format above matches what is actually at that URL.',
+      );
+    }
+    return false;
+  } finally {
+    $('source-busy').textContent = '';
+    $('source-load').disabled = false;
+  }
+}
+
+async function loadSamples() {
+  $('source-busy').textContent = 'loading samples…';
+  try {
+    const prepared = [];
+    for (const spec of SAMPLE_FILES) prepared.push(await prepare(spec, false));
+    commit(prepared);
+    state.source = { ...state.source, mode: SAMPLES };
+    setSourceMode(SAMPLES);
+    refreshVerdicts();
+  } finally {
+    $('source-busy').textContent = '';
+  }
+}
+
+function setSourceMode(mode) {
+  const custom = mode === 'custom';
+  $('source-samples').setAttribute('aria-checked', String(!custom));
+  $('source-custom').setAttribute('aria-checked', String(custom));
+  $('custom-fields').hidden = !custom;
+  $('source-meta').textContent = custom
+    ? `${formatName(state.files.parquet ? 'parquet' : 'cog')} from ${isCrossOrigin(state.source.url || location.href) ? new URL(state.source.url, location.href).host : 'this origin'}`
+    : 'two bundled samples';
+}
+
 // ---- wiring -------------------------------------------------------------
 
 function setMode(mode) {
@@ -629,10 +1021,19 @@ function setMode(mode) {
   renderLog();
 }
 
+function setPanel(id, open) {
+  $(`${id}-toggle`).setAttribute('aria-expanded', String(open));
+  $(`${id}-body`).hidden = !open;
+  if (open) state.panels.add(id); else state.panels.delete(id);
+}
+
 function applyPreset(preset) {
   const current = aoiBboxFrom($('policy').value);
-  const aoi = AOIS.find((a) => current && a.bbox.every((v, i) => v === current[i])) || AOIS[0];
-  $('policy').value = preset.build(aoiWkt(aoi));
+  const aois = currentAois();
+  const aoi = aois.find((a) => current && a.bbox.every((v, i) => v === current[i])) || pickedAoi();
+  state.preset = preset.id;
+  state.aoi = aoi.id;
+  $('policy').value = preset.build({ wkt: aoiWkt(aoi), withheld: withheldColumns() });
   $('preset-note').textContent = preset.blurb;
   loadPolicy();
   paintAoi();
@@ -644,18 +1045,91 @@ function applyAoi(aoi) {
     $('aoi-note').textContent = `This policy has no spatial rule, so ${aoi.name} changes nothing. Pick a policy with a licensed area first.`;
     return;
   }
+  state.aoi = aoi.id;
   $('policy').value = substituteAoi(text, aoiWkt(aoi));
   $('aoi-note').textContent = aoi.note;
   loadPolicy();
   paintAoi();
 }
 
-function chip(label, onClick) {
-  const button = document.createElement('button');
+function chip(label, onClick, title) {
+  const button = el('button', '', label);
   button.type = 'button';
-  button.textContent = label;
+  if (title) button.title = title;
   button.addEventListener('click', onClick);
   return button;
+}
+
+function buildAoiChips() {
+  const host = $('aoi-presets');
+  host.textContent = '';
+  for (const aoi of currentAois()) host.append(chip(aoi.name, () => { applyAoi(aoi); writeUrl(); }));
+}
+
+/**
+ * Everything the query string says, applied.
+ *
+ * Every value here is untrusted: it goes into a form field as text and then
+ * through the same validation a typed one does. A policy that arrives broken
+ * shows the inline diagnostic and the page keeps working.
+ */
+async function applyQuery() {
+  const q = new URLSearchParams(location.search);
+
+  const user = q.get('u');
+  $('principal').value = user === null ? PRINCIPAL : await unpack(user);
+
+  const fmt = q.get('fmt');
+  if (fmt && FORMATS.some((f) => f.id === fmt)) $('source-format').value = fmt;
+
+  const file = q.get('file');
+  let loaded = false;
+  if (file) {
+    $('source-url').value = file;
+    setSourceMode('custom');
+    describeDetection();
+    loaded = await loadCustom(file, { announce: false });
+  }
+  if (!loaded) {
+    await loadSamples();
+    if (file) {
+      state.source = { ...state.source, url: file, format: fmt || 'auto', failed: true };
+      // The URL in the link did not load. Leave the box filled in with the
+      // diagnostic showing, but on the samples so the page still works.
+      $('source-url').value = file;
+      $('custom-fields').hidden = false;
+      $('source-samples').setAttribute('aria-checked', 'true');
+      $('source-custom').setAttribute('aria-checked', 'false');
+    }
+  }
+
+  buildAoiChips();
+
+  const presetId = q.get('preset');
+  const preset = POLICY_PRESETS.find((p) => p.id === presetId) || POLICY_PRESETS[0];
+  const aoiId = q.get('aoi');
+  const aoi = currentAois().find((a) => a.id === aoiId) || currentAois()[0];
+  state.aoi = aoi.id;
+  applyPreset(preset);
+  $('aoi-note').textContent = aoi.note;
+
+  const policyText = q.get('p');
+  if (policyText !== null) {
+    $('policy').value = await unpack(policyText);
+    loadPolicy();
+    paintAoi();
+  }
+
+  const level = q.get('lvl');
+  if (level && [...$('cog-level').options].some((o) => o.value === level)) {
+    $('cog-level').value = level;
+  }
+
+  setMode(q.get('m') === 'aligned' ? 'aligned' : 'coalesced');
+
+  const panels = q.get('panel');
+  const open = new Set((panels === null ? PANELS_DEFAULT : panels).split(',').filter(Boolean));
+  for (const id of PANELS) setPanel(id, open.has(id));
 }
 
 async function boot() {
@@ -666,19 +1140,30 @@ async function boot() {
   $('queryable-count').title = schema.join('\n');
 
   for (const preset of POLICY_PRESETS) {
-    $('policy-presets').append(chip(preset.name, () => applyPreset(preset)));
+    $('policy-presets').append(chip(preset.name, () => { applyPreset(preset); writeUrl(); }));
   }
-  for (const aoi of AOIS) {
-    $('aoi-presets').append(chip(aoi.name, () => applyAoi(aoi)));
-  }
-  $('principal').value = PRINCIPAL;
-  applyPreset(POLICY_PRESETS[0]);
-  $('aoi-note').textContent = AOIS[0].note;
 
-  $('policy').addEventListener('input', () => { loadPolicy(); paintAoi(); });
-  $('principal').addEventListener('input', loadPolicy);
-  $('mode-coalesced').addEventListener('click', () => setMode('coalesced'));
-  $('mode-aligned').addEventListener('click', () => setMode('aligned'));
+  const select = $('source-format');
+  for (const [value, name] of [['auto', 'detect from the URL'], ...FORMATS.map((f) => [f.id, f.name])]) {
+    const option = el('option', '', name);
+    option.value = value;
+    select.append(option);
+  }
+  for (const example of EXAMPLES) {
+    $('source-examples').append(chip(example.name, () => {
+      $('source-url').value = example.url;
+      $('source-format').value = 'auto';
+      $('source-example-note').textContent = example.note;
+      describeDetection();
+      loadCustom(example.url);
+    }, example.url));
+  }
+
+  $('policy').addEventListener('input', () => { loadPolicy(); paintAoi(); writeUrlSoon(); });
+  $('principal').addEventListener('input', () => { loadPolicy(); writeUrlSoon(); });
+  $('mode-coalesced').addEventListener('click', () => { setMode('coalesced'); writeUrl(); });
+  $('mode-aligned').addEventListener('click', () => { setMode('aligned'); writeUrl(); });
+  $('cog-level').addEventListener('change', writeUrl);
   $('parquet-run').addEventListener('click', () => runOne('parquet', state.mode));
   $('cog-run').addEventListener('click', () => runOne('cog', state.mode));
   $('parquet-both').addEventListener('click', async () => {
@@ -690,49 +1175,44 @@ async function boot() {
     await runOne('cog', 'aligned');
   });
 
-  $('parquet-query').textContent =
-    `SELECT ${QUERY_COLUMNS.join(', ')} — all 400,000 rows, all 8 row groups. ` +
-    'Boundary-aligned passes that column list to hyparquet; the default position does not pass one, ' +
-    'so hyparquet reads every column and merges each row group into a single request under its 2 MB run limit.';
-  $('cog-query').textContent =
-    `Read the licensed area at one overview level. Boundary-aligned hands the policy source straight to geotiff.js; ` +
-    `the default position wraps it in the same ${BLOCK_SIZE / 1024} KB blocking layer fromUrl installs, which aligns reads to blocks rather than to tiles.`;
-
-  const hosting = [];
-  for (const [key, url] of Object.entries(DATA)) {
-    const file = { key, url, cells: new Map(), runs: {} };
-    state.files[key] = file;
-    const info = await probe(url);
-    file.size = info.size;
-    hosting.push(
-      `${key} ${info.rangeStatus}${info.servedWhole ? ' whole body' : ''}, ${info.contentEncoding}`,
-    );
-
-    const { index, window } = await buildIndex(key === 'parquet' ? 'parquet' : 'cog', url, info.size);
-    file.index = index;
-    file.regions = JSON.parse(index.regions());
-    file.window = window;
-
-    if (key === 'parquet') {
-      buildParquetGrid(file);
-      $('parquet-meta').textContent = `nyc-taxi-8rg.parquet · ${bytes(info.size)} · ${index.regionCount} regions · footer read from the last ${bytes(window)}`;
-    } else {
-      buildCogGrid(file);
-      const levels = file.levels.map((l) => l.tiles).reduce((a, b) => a + b, 0);
-      $('cog-meta').textContent = `s2-tci-512.tif · ${bytes(info.size)} · ${levels} tiles · IFDs read from the first ${bytes(window)}`;
-      const select = $('cog-level');
-      for (const l of file.levels) {
-        const option = document.createElement('option');
-        option.value = String(l.level);
-        option.textContent = `L${l.level} — ${l.tiles} tile${l.tiles === 1 ? '' : 's'}`;
-        select.append(option);
-      }
-      select.value = '0';
+  $('source-samples').addEventListener('click', async () => {
+    if (state.source.mode === SAMPLES && !state.source.failed) return;
+    await loadSamples();
+    state.source.failed = false;
+    buildAoiChips();
+    applyPreset(POLICY_PRESETS.find((p) => p.id === state.preset) || POLICY_PRESETS[0]);
+    await writeUrl();
+  });
+  $('source-custom').addEventListener('click', () => {
+    $('custom-fields').hidden = false;
+    $('source-custom').setAttribute('aria-checked', 'true');
+    $('source-samples').setAttribute('aria-checked', 'false');
+    $('source-url').focus();
+  });
+  $('source-url').addEventListener('input', describeDetection);
+  $('source-format').addEventListener('change', describeDetection);
+  $('source-load').addEventListener('click', async () => {
+    if (await loadCustom($('source-url').value)) {
+      buildAoiChips();
+      applyPreset(POLICY_PRESETS.find((p) => p.id === state.preset) || POLICY_PRESETS[0]);
+      await writeUrl();
     }
-  }
+  });
+  $('source-url').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') $('source-load').click();
+  });
 
-  $('hosting').textContent = hosting.join(' · ');
-  refreshVerdicts();
+  for (const id of PANELS) {
+    $(`${id}-toggle`).addEventListener('click', () => {
+      setPanel(id, $(`${id}-toggle`).getAttribute('aria-expanded') !== 'true');
+      writeUrl();
+    });
+  }
+  $('copy-link').addEventListener('click', copyLink);
+
+  await applyQuery();
+  state.booting = false;
+  await writeUrl();
 }
 
 boot().catch((err) => {

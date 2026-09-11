@@ -210,6 +210,34 @@ npx serve .                   # Node
 ruby -run -e httpd . -p 8000  # Ruby, no install needed on macOS
 ```
 
+#### Pointing it at your own file
+
+The **Data source** panel takes a URL to any Parquet or COG. The format comes
+from the extension and can be overridden; a `.zarr` path or an Icechunk
+repository layout is named as such and refused with its tracking issue, because
+"no magic bytes" is not an answer anyone can act on.
+
+Nearly every failure here is the host, so the page says which one:
+
+| what happened | what it means |
+| --- | --- |
+| the fetch threw, no status | CORS, or nothing listening. A cross-origin ranged GET needs `Access-Control-Allow-Origin`, an `OPTIONS` answer with `Access-Control-Allow-Headers: Range`, and `Access-Control-Expose-Headers: Content-Range`. |
+| `403` / `404` | the host answered and said no: private object, wrong key, requester-pays |
+| `200` with the whole body | the §14.2 case above, and the demo stops: the bytes that arrived are not the bytes it asked for |
+
+Two public objects verified to serve CORS *and* ranges to a browser are offered
+as examples — a Sentinel-2 COG on AWS Open Data and a 540 kB Parquet on Hugging
+Face. Most buckets fail at the preflight.
+
+#### Sharing a configuration
+
+Every control is in the query string, rewritten with `replaceState` as you go,
+and **copy link** puts the current URL on the clipboard. The policy and the
+principal are deflated with `CompressionStream` and base64url'd — a 1,347-byte
+policy document becomes a 401-character parameter — and each value names its own
+encoding in its first character, so an uncompressed or hand-written link still
+reads. A link with no parameters is the page at its defaults.
+
 ### Regenerating the sample data
 
 Only needed if you change the fixtures. Requires `duckdb` and `gdal`:

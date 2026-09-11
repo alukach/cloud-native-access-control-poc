@@ -14,6 +14,10 @@
   <span id="version">loading wasm…</span>
   <span id="hosting"></span>
   <a href="https://github.com/alukach/cloud-native-access-control-poc">source</a>
+  <span class="rail-end">
+    <button type="button" id="copy-link">copy link</button>
+    <span id="copy-note"></span>
+  </span>
 </div>
 
 <main class="wrap">
@@ -48,9 +52,11 @@
           <div class="chips" id="policy-presets"></div>
           <p class="preset-note" id="preset-note"></p>
 
-          <div class="field-label"><span>Licensed area</span></div>
-          <div class="chips" id="aoi-presets"></div>
-          <p class="preset-note" id="aoi-note"></p>
+          <div id="aoi-block">
+            <div class="field-label"><span>Licensed area</span></div>
+            <div class="chips" id="aoi-presets"></div>
+            <p class="preset-note" id="aoi-note"></p>
+          </div>
 
           <div class="field-label">
             <label for="principal">Principal</label>
@@ -63,6 +69,62 @@
     </div>
 
     <div class="main">
+
+      <section class="panel" id="source-panel">
+        <header>
+          <button type="button" class="disclosure" id="source-toggle"
+                  aria-expanded="true" aria-controls="source-body">
+            <h2>Data source</h2>
+          </button>
+          <span class="meta" id="source-meta">two bundled samples</span>
+        </header>
+        <div class="body" id="source-body">
+          <div class="toggle" role="radiogroup" aria-label="Data source">
+            <button type="button" role="radio" id="source-samples" aria-checked="true">
+              Bundled samples
+              <span>nyc-taxi-8rg.parquet · s2-tci-512.tif</span>
+            </button>
+            <button type="button" role="radio" id="source-custom" aria-checked="false">
+              A file of your own
+              <span>any Parquet or COG served over range requests</span>
+            </button>
+          </div>
+
+          <div id="custom-fields" hidden>
+            <div class="field-label">
+              <label for="source-url">Object URL</label>
+              <span class="meta" id="source-detected"></span>
+            </div>
+            <div class="source-row">
+              <input type="text" id="source-url" spellcheck="false" autocomplete="off"
+                     placeholder="https://example.com/scene.tif"
+                     aria-describedby="source-diag">
+              <select id="source-format" aria-label="Format"></select>
+              <button type="button" class="go" id="source-load">Load</button>
+            </div>
+            <span class="busy" id="source-busy"></span>
+            <div class="diag ok" id="source-diag"></div>
+
+            <div class="field-label"><span>Public objects that really do serve ranges to a browser</span></div>
+            <div class="chips" id="source-examples"></div>
+            <p class="preset-note" id="source-example-note"></p>
+
+            <p class="preset-note">
+              The read pattern is not the same for the two formats. Parquet keeps its footer at
+              the end, so the first read is a <em>suffix</em>; a GeoTIFF keeps its IFDs at the
+              front, so the first read is a <em>prefix</em>. Both start at 16 KB and double until
+              the metadata fits.
+            </p>
+            <p class="preset-note">
+              Cross-origin, the host has to opt in three times: <code>Access-Control-Allow-Origin</code>,
+              an <code>OPTIONS</code> answer carrying <code>Access-Control-Allow-Headers: Range</code>
+              (<code>Range</code> is not a safelisted request header, so a ranged GET preflights), and
+              <code>Access-Control-Expose-Headers: Content-Range</code>. Most buckets send none of them,
+              and no amount of code on this page can substitute for any of them.
+            </p>
+          </div>
+        </div>
+      </section>
 
       <section class="panel">
         <header>
@@ -90,7 +152,7 @@
 
       <section class="panel" id="parquet-panel">
         <header>
-          <h2>Parquet · 8 row groups × 19 columns</h2>
+          <h2 id="parquet-title">Parquet</h2>
           <span class="meta" id="parquet-meta">nyc-taxi-8rg.parquet</span>
         </header>
         <div class="body">
@@ -114,7 +176,7 @@
 
       <section class="panel" id="cog-panel">
         <header>
-          <h2>Cloud-optimized GeoTIFF · 6 levels, 655 tiles</h2>
+          <h2 id="cog-title">Cloud-optimized GeoTIFF</h2>
           <span class="meta" id="cog-meta">s2-tci-512.tif</span>
         </header>
         <div class="body">
@@ -144,12 +206,15 @@
         </div>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="log-panel">
         <header>
-          <h2>Request log</h2>
+          <button type="button" class="disclosure" id="log-toggle"
+                  aria-expanded="true" aria-controls="log-body">
+            <h2>Request log</h2>
+          </button>
           <span class="meta" id="log-which">nothing run yet</span>
         </header>
-        <div class="body">
+        <div class="body" id="log-body">
           <div class="log-scroll" id="log"></div>
         </div>
       </section>

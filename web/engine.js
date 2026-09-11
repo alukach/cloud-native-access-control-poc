@@ -5,6 +5,7 @@
 // is the same Rust function a gateway would call.
 
 import init, { LayoutIndex, Policy, queryables, version } from './pkg/cnac.js';
+import { corsError, httpError, opaqueError, rangeIgnoredError } from './source.js';
 import { parquetRead } from 'https://cdn.jsdelivr.net/npm/hyparquet@1.30.0/+esm';
 import { GeoTIFF } from 'https://cdn.jsdelivr.net/npm/geotiff@2.1.3/+esm';
 import { BlockedSource } from 'https://cdn.jsdelivr.net/npm/geotiff@2.1.3/dist-module/source/blockedsource.js/+esm';
@@ -23,6 +24,25 @@ export async function ready() {
 
 // ---- HTTP ----------------------------------------------------------------
 
+/** Is this URL somewhere the browser will apply CORS to? */
+export const isCrossOrigin = (url) => new URL(url, location.href).origin !== location.origin;
+
+/**
+ * `fetch`, with the one failure a browser gives no detail about named.
+ *
+ * A cross-origin fetch that the host has not opted into rejects with a
+ * `TypeError` carrying no status, no headers and no body -- indistinguishable
+ * from the network being down, except that it is almost never the network.
+ */
+async function guardedFetch(url, init) {
+  try {
+    return await fetch(url, init);
+  } catch (err) {
+    if (isCrossOrigin(url)) throw corsError(url, err?.message || String(err));
+    throw err;
+  }
+}
+
 /**
  * One range request. `end` is exclusive.
  *
@@ -35,16 +55,23 @@ async function fetchRange(url, start, end) {
   // `no-store` keeps the browser from revalidating a range it already holds.
   // A `304` carries no body, and a counter that silently reuses a cached slice
   // is not counting range requests any more.
-  const res = await fetch(url, {
+  const res = await guardedFetch(url, {
     cache: 'no-store',
     headers: { Range: `bytes=${start}-${end - 1}` },
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText} for bytes=${start}-${end - 1}`);
+  if (!res.ok) throw httpError(url, res.status, res.statusText);
   const body = await res.arrayBuffer();
   if (res.status === 200 && body.byteLength > end - start) {
     return { bytes: body.slice(start, end), fullBody: true, transferred: body.byteLength };
   }
   return { bytes: body, fullBody: false, transferred: body.byteLength };
+}
+
+/** The total length out of `Content-Range: bytes 0-0/12345`, if it is readable. */
+function totalFromContentRange(res) {
+  const header = res.headers.get('content-range');
+  const total = header && /\/\s*(\d+)\s*$/.exec(header);
+  return total ? Number(total[1]) : null;
 }
 
 /**
@@ -54,20 +81,62 @@ async function fetchRange(url, start, end) {
  * answers the first request with the whole body and only serves ranges once it
  * is cached, so this is also the warm-up that keeps that first `200` out of
  * the counters the page is about to report.
+ *
+ * `strict` is for a URL the user typed. The two files this page ships with are
+ * known to be range-served, and a cold CDN `200` on one of them is a warm-up;
+ * on somebody else's URL the same `200` is the answer, and the demo has to
+ * stop and say so rather than read bytes it did not ask for.
  */
-export async function probe(url) {
-  const head = await fetch(url, { method: 'HEAD' });
-  if (!head.ok) throw new Error(`${head.status} ${head.statusText} for ${url}`);
-  const size = Number(head.headers.get('content-length'));
-  if (!Number.isFinite(size) || size <= 0) throw new Error(`no content-length for ${url}`);
+export async function probe(url, { strict = false } = {}) {
+  let res = await guardedFetch(url, { cache: 'no-store', headers: { Range: 'bytes=0-0' } });
+  let body = await res.arrayBuffer();
+  if (!res.ok) throw httpError(url, res.status, res.statusText);
 
-  const probeRes = await fetch(url, { cache: 'no-store', headers: { Range: 'bytes=0-0' } });
-  const body = await probeRes.arrayBuffer();
+  // A cold CDN edge answers the first request with the whole body and serves
+  // ranges from the second. One retry separates that from a host that has
+  // simply never implemented §14.2.
+  if (strict && res.status === 200 && body.byteLength > 1) {
+    res = await guardedFetch(url, { cache: 'no-store', headers: { Range: 'bytes=0-0' } });
+    body = await res.arrayBuffer();
+    if (!res.ok) throw httpError(url, res.status, res.statusText);
+    if (res.status === 200 && body.byteLength > 1) throw rangeIgnoredError(url, 1, body.byteLength);
+  }
+
+  let size = totalFromContentRange(res);
+  let contentEncoding = res.headers.get('content-encoding') || 'identity';
+
+  // `Content-Range` is not a CORS-safelisted response header, so a host that
+  // allows this origin but exposes nothing leaves the size unknown. HEAD is
+  // the fallback, not the first move: some hosts are slow to answer it (a
+  // redirect chain doubles), and one that answers the range properly has
+  // already said everything needed.
+  if (!Number.isFinite(size) || size <= 0) {
+    let head = null;
+    try {
+      head = await guardedFetch(url, { method: 'HEAD' });
+    } catch (err) {
+      if (!strict) throw err;
+    }
+    if (head?.ok) {
+      const length = Number(head.headers.get('content-length'));
+      if (Number.isFinite(length) && length > 0) size = length;
+      contentEncoding = head.headers.get('content-encoding') || 'identity';
+    } else if (head && !strict) {
+      throw httpError(url, head.status, head.statusText);
+    }
+  }
+
+  if (!Number.isFinite(size) || size <= 0) {
+    if (strict) throw opaqueError(url);
+    throw new Error(`no content-length for ${url}`);
+  }
+
   return {
     size,
-    rangeStatus: probeRes.status,
+    rangeStatus: res.status,
     servedWhole: body.byteLength > 1,
-    contentEncoding: head.headers.get('content-encoding') || 'identity',
+    contentEncoding,
+    crossOrigin: isCrossOrigin(url),
   };
 }
 
@@ -81,7 +150,14 @@ export async function probe(url) {
  * following it literally converges one structure at a time. It is treated as a
  * floor under a doubling window instead, which reaches this file's 8,264 bytes
  * on the first try.
+ *
+ * The first guess is 16 KiB because it covers the metadata of both files this
+ * page ships with, so the common case is one round trip. `MAX_WINDOW` is the
+ * stop for somebody else's file: past it the "read the metadata" story is over
+ * and the page is just downloading the object.
  */
+const MAX_WINDOW = 64 * 1024 * 1024;
+
 export async function buildIndex(format, url, size, log = () => {}) {
   const suffix = format === 'parquet';
   let want = 16384;
@@ -96,6 +172,13 @@ export async function buildIndex(format, url, size, log = () => {}) {
       const needed = Number(err?.needed);
       if (!Number.isFinite(needed) || needed <= 0) throw err;
       if (span >= size) throw err;
+      if (span >= MAX_WINDOW) {
+        throw new Error(
+          `The ${format} metadata does not fit in ${MAX_WINDOW / 1024 / 1024} MB, which is as far `
+          + 'as this page will speculate. Reading further would be downloading the object, not '
+          + 'indexing it.',
+        );
+      }
       want = Math.max(needed, want * 2);
     }
   }
@@ -183,7 +266,7 @@ export function makeGate({ index, policy, user, url, labels, onRequest }) {
  * is the difference between eight fetches that each span all nineteen columns
  * and one fetch per chunk.
  */
-export async function runParquet({ gate, size, columns, aligned }) {
+export async function runParquet({ gate, size, columns, aligned, rowEnd }) {
   const file = {
     byteLength: size,
     slice: (start, end = size) => gate.read(start, end),
@@ -193,6 +276,10 @@ export async function runParquet({ gate, size, columns, aligned }) {
   await parquetRead({
     file,
     initialFetchSize: FOOTER_FETCH,
+    // A row cap only exists for somebody else's file, where "all of it" can be
+    // a hundred million rows. hyparquet skips the row groups it falls outside,
+    // so the cap bounds the fetching, not just the decoding.
+    ...(rowEnd === undefined ? {} : { rowEnd }),
     columns: aligned ? columns : undefined,
     onChunk: ({ columnName, columnData }) => {
       if (columnName === columns[0]) rows += columnData.length;

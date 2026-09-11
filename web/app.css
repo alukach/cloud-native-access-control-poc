@@ -85,6 +85,9 @@ code, .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 }
 .rail strong { color: var(--ink); font-weight: 600; }
 .rail a { color: inherit; }
+.rail-end { margin-left: auto; display: flex; gap: 0.5rem; align-items: baseline; }
+.rail-end button { font-size: 0.75rem; font-family: var(--mono); padding: 0.125rem 0.5rem; }
+#copy-note { color: var(--allow); }
 
 .wrap {
   max-width: 1360px;
@@ -129,6 +132,56 @@ code, .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 }
 .panel .body { padding: 1rem; }
 
+/* A panel header that folds its body away. The caret is the only addition to
+   the header's existing shape, so an open disclosure looks like every other
+   panel on the page. */
+.disclosure {
+  border: 0;
+  background: none;
+  padding: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 0.4375rem;
+  color: inherit;
+}
+.disclosure:hover { border-color: transparent; }
+.disclosure::before {
+  content: "";
+  border: 0.3125rem solid transparent;
+  border-left-color: var(--ink-3);
+  border-right-width: 0;
+  translate: 0 -0.0625rem;
+}
+.disclosure[aria-expanded="true"]::before {
+  border-left-color: transparent;
+  border-top-color: var(--ink-3);
+  border-bottom-width: 0;
+  border-left-width: 0.3125rem;
+  border-right-width: 0.3125rem;
+  translate: -0.125rem 0;
+}
+
+/* ---- Data source ------------------------------------------------------- */
+
+.source-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+.source-row input[type="text"] { flex: 1 1 16rem; min-width: 0; }
+.source-row select { width: auto; flex: 0 1 auto; }
+.source-row button { flex: 0 0 auto; }
+
+.diag.loud {
+  border-color: var(--straddle);
+  background: var(--straddle-soft);
+  font-size: 0.75rem;
+}
+.diag b { display: block; font-size: 0.8125rem; margin-bottom: 0.375rem; }
+.diag a { color: inherit; text-decoration: underline; word-break: break-all; }
+.diag:empty { display: none; }
+
 /* ---- Policy editor ---------------------------------------------------- */
 
 textarea, select, input[type="text"] {
@@ -148,6 +201,7 @@ textarea { resize: vertical; tab-size: 2; white-space: pre; overflow-wrap: norma
 
 .field-label {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: baseline;
   gap: 0.75rem;
