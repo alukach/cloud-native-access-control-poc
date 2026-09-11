@@ -5,6 +5,7 @@ pub mod parquet;
 pub mod policy;
 pub mod range;
 pub mod rewrite;
+pub mod sparse;
 pub mod wasm;
 
 pub fn version() -> &'static str {

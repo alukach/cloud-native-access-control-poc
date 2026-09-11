@@ -1,0 +1,42 @@
+# The licence this gateway enforces on `data/s2-tci-512.tif`: full resolution
+# only inside a licensed area, coarse imagery everywhere.
+#
+# Written as three rules on purpose.
+allow:
+  # The structure. `header`, `ghost_area`, `ifd`, `tile_offsets`,
+  # `tile_byte_counts`, `geo_keys` and `tag_values` are the only names the COG
+  # resolver emits, and without them no reader can find a tile at all --
+  # `tile_offsets` most of all, since it is the array `sparse::plan` edits.
+  #
+  # `sparse::plan` never asks about these; it serves the structure
+  # unconditionally, because a representation that withheld it would not be a
+  # TIFF. `--mode refuse` does ask, and the same policy has to work in both so
+  # the comparison is honest.
+  - "region.kind = 'metadata'"
+
+  # Every overview, at every level. This is the shape of a real imagery
+  # licence -- browse resolution for everyone, full resolution for subscribers
+  # -- and it is also the thing that makes the AOI recoverable: the coarse
+  # levels still show, at 20 m and worse, the ground the full-resolution rule
+  # withholds. That trade is the licensor's to make and it is stated rather
+  # than hidden.
+  #
+  # `> 0` and not `>= 1` for the same reason `overview_level` is a rank and not
+  # a ratio: level 0 is full resolution, and a higher level is always coarser.
+  - "region.overview_level > 0"
+
+  # Full resolution, inside the licensed area only.
+  #
+  # The polygon is EPSG:32610 metres, which is the CRS the file's GeoKeys
+  # declare and therefore the CRS `region.geom` is in. cql2's spatial operators
+  # are planar and CRS-agnostic (issue #5), so a polygon in degrees here would
+  # match nothing and deny everything -- fail-closed, but for the wrong reason.
+  #
+  # Its corners sit strictly inside tile boundaries rather than on them: the
+  # 512-pixel tiles of this file are 5,120 m across, and an AOI edge landing
+  # exactly on one would make the neighbouring tile *touch* the polygon, which
+  # `S_INTERSECTS` counts. This one grants tiles x 5-9, y 5-9 and nothing else,
+  # so the demo's arithmetic is exact.
+  - >-
+    region.overview_level = 0 AND S_INTERSECTS(region.geom, POLYGON((
+      526000 4149000, 551000 4149000, 551000 4174000, 526000 4174000, 526000 4149000)))

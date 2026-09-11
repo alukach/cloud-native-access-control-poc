@@ -299,6 +299,63 @@ pub enum CogError {
     Layout(#[from] IndexError),
 }
 
+/// Where one out-of-line array of fixed-width integers physically lives.
+///
+/// This is the address [`crate::sparse`] writes zeroes at, and the reason the
+/// COG analogue of footer rewrite needs no codec: `TileOffsets` and
+/// `TileByteCounts` are arrays of fixed-width values, so withholding a tile is
+/// a **same-length overwrite** rather than a re-serialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileArray {
+    /// Object offset of element 0.
+    ///
+    /// A value of four bytes or fewer -- a single-tile overview's `TileOffsets`
+    /// -- lives INSIDE its twelve-byte IFD entry rather than at an offset, and
+    /// this is the right address in both cases. Both committed COGs have such
+    /// an image, so the inline case is not hypothetical.
+    pub at: u64,
+    /// The width of one element in bytes: 2 for SHORT, 4 for LONG.
+    pub width: u8,
+    /// How many elements, which is the image's tile count.
+    pub count: u64,
+}
+
+/// One image's tile addressing: the grid, and where the two arrays that
+/// address it live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageArrays {
+    /// The `overview_level` this image's [`RegionKind::Tile`] regions carry, or
+    /// `None` for a mask image -- which gets no tile regions at all, so there
+    /// is no level to name (issue #21).
+    pub overview_level: Option<u32>,
+    /// Tiles across the image, so tile `(x, y)` is element `y * across + x`.
+    pub across: u64,
+    /// Tiles down the image.
+    pub down: u64,
+    pub offsets: TileArray,
+    pub byte_counts: TileArray,
+}
+
+/// The physical addressing [`build_index`] computes and discards.
+///
+/// Emitted by [`build_index_with_layout`] rather than re-derived, for the
+/// reason [`crate::rewrite`] gives about Parquet: a second offset derivation is
+/// a second place to get the offsets wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CogLayout {
+    /// `MM` rather than `II`. Zeroes are endian-agnostic, so nothing in
+    /// [`crate::sparse`] needs this; a caller reading the arrays back -- a test
+    /// asserting an entry really did become zero -- does.
+    pub big_endian: bool,
+    /// The GDAL block leader width the ghost area declared, or 0.
+    pub leader: u64,
+    /// The GDAL block trailer width the ghost area declared, or 0.
+    pub trailer: u64,
+    /// One entry per IFD, in walk order. Empty for a striped TIFF, which
+    /// classifies nothing (rule 5).
+    pub images: Vec<ImageArrays>,
+}
+
 /// Parse a TIFF's metadata prefix into the layout index of the object it
 /// belongs to.
 ///
@@ -311,6 +368,18 @@ pub enum CogError {
 /// Coverage of `[0, object_size)` is total, because [`LayoutIndex::try_new`]
 /// fills whatever this resolver did not claim with [`RegionKind::Unmapped`].
 pub fn build_index(bytes: &[u8], object_size: u64) -> Result<LayoutIndex, CogError> {
+    build_index_with_layout(bytes, object_size).map(|(index, _)| index)
+}
+
+/// [`build_index`], plus the physical addressing of every tile array.
+///
+/// The extra return value is what [`crate::sparse::plan`] needs and the index
+/// cannot carry: a [`RegionKind::Tile`] says which tile it is and which bytes
+/// it owns, but not where the two integers that point at it live.
+pub fn build_index_with_layout(
+    bytes: &[u8],
+    object_size: u64,
+) -> Result<(LayoutIndex, CogLayout), CogError> {
     let buffer = bytes.len() as u64;
     if buffer > object_size {
         return Err(CogError::NotAPrefix {
@@ -413,8 +482,18 @@ pub fn build_index(bytes: &[u8], object_size: u64) -> Result<LayoutIndex, CogErr
 
         let offsets = vector(&mut tags, TILE_OFFSETS)?;
         let Some(offsets) = offsets else {
-            // Rule 5: a striped image. Nothing in this object is classified.
-            return Ok(LayoutIndex::try_new(Vec::new(), object_size)?);
+            // Rule 5: a striped image. Nothing in this object is classified --
+            // and an empty layout is the honest companion to an empty index,
+            // because there is no tile array to address.
+            return Ok((
+                LayoutIndex::try_new(Vec::new(), object_size)?,
+                CogLayout {
+                    big_endian,
+                    leader: 0,
+                    trailer: 0,
+                    images: Vec::new(),
+                },
+            ));
         };
         let lengths = vector(&mut tags, TILE_BYTE_COUNTS)?.unwrap_or_default();
         if offsets.len() != lengths.len() {
@@ -426,12 +505,45 @@ pub fn build_index(bytes: &[u8], object_size: u64) -> Result<LayoutIndex, CogErr
             )));
         }
 
+        // Where the two arrays physically are. From the SCAN, which is the only
+        // parse that knows: `tiff` 0.11 resolves a value and forgets its
+        // address. An array of four bytes or fewer never left its IFD entry, so
+        // its base is the entry's own value field.
+        let placement = |tag: u16| -> Result<TileArray, CogError> {
+            let entry = scanned.get(&tag).ok_or_else(|| {
+                CogError::Malformed(format!("IFD at {}: no tag {tag}", raw.offset))
+            })?;
+            let width = match type_size(entry.field_type) {
+                2 => 2u8,
+                4 => 4u8,
+                other => {
+                    return Err(CogError::Malformed(format!(
+                        "IFD at {}: tag {tag} has {other}-byte elements, not SHORT or LONG",
+                        raw.offset
+                    )))
+                }
+            };
+            Ok(TileArray {
+                at: entry.value.map_or(entry.at + 8, |(start, _)| start),
+                width,
+                count: entry.count,
+            })
+        };
+        let arrays = (placement(TILE_OFFSETS)?, placement(TILE_BYTE_COUNTS)?);
+        if arrays.0.count != offsets.len() as u64 || arrays.1.count != lengths.len() as u64 {
+            return Err(CogError::Malformed(format!(
+                "IFD at {}: the tile array scan and the decoded values disagree about length",
+                raw.offset
+            )));
+        }
+
         let require = |value: Option<u64>, tag: u16| {
             value
                 .filter(|v| *v > 0)
                 .ok_or_else(|| CogError::Malformed(format!("IFD at {}: no tag {tag}", raw.offset)))
         };
         let image = ImageLayout {
+            arrays,
             width: require(scalar(&mut tags, IMAGE_WIDTH)?, IMAGE_WIDTH)?,
             height: require(scalar(&mut tags, IMAGE_LENGTH)?, IMAGE_LENGTH)?,
             tile_width: require(scalar(&mut tags, TILE_WIDTH)?, TILE_WIDTH)?,
@@ -514,17 +626,30 @@ pub fn build_index(bytes: &[u8], object_size: u64) -> Result<LayoutIndex, CogErr
     }
 
     let (leader, trailer) = ghost.map_or((0, 0), |g| (g.leader, g.trailer));
+    let mut layout_images = Vec::with_capacity(images.len());
     for image in &images {
-        // Masks get no tile regions; see the module docs.
-        if image.is_mask {
-            continue;
-        }
-        let level = widths
-            .iter()
-            .position(|w| *w == image.width)
-            .expect("every non-mask width is in the list") as u32;
         let across = image.width.div_ceil(image.tile_width);
         let down = image.height.div_ceil(image.tile_height);
+        // Masks get no tile regions; see the module docs. They DO get a layout
+        // entry, carrying no level, so that a caller can see the object has a
+        // mask it cannot reason about rather than silently not find one --
+        // which is what `sparse::plan` refuses on.
+        let level = (!image.is_mask).then(|| {
+            widths
+                .iter()
+                .position(|w| *w == image.width)
+                .expect("every non-mask width is in the list") as u32
+        });
+        layout_images.push(ImageArrays {
+            overview_level: level,
+            across,
+            down,
+            offsets: image.arrays.0,
+            byte_counts: image.arrays.1,
+        });
+        let Some(level) = level else {
+            continue;
+        };
         if across.checked_mul(down) != Some(image.tiles.len() as u64) {
             return Err(CogError::Malformed(format!(
                 "a {across}x{down} tile grid but {} tile offsets",
@@ -583,7 +708,15 @@ pub fn build_index(bytes: &[u8], object_size: u64) -> Result<LayoutIndex, CogErr
 
     pad_word_aligned_values(&mut regions);
 
-    Ok(LayoutIndex::try_new(regions, object_size)?)
+    Ok((
+        LayoutIndex::try_new(regions, object_size)?,
+        CogLayout {
+            big_endian,
+            leader,
+            trailer,
+            images: layout_images,
+        },
+    ))
 }
 
 fn named(name: &str) -> RegionKind {
@@ -655,6 +788,8 @@ struct ImageLayout {
     tile_width: u64,
     tile_height: u64,
     is_mask: bool,
+    /// Where `TileOffsets` and `TileByteCounts` physically live.
+    arrays: (TileArray, TileArray),
     /// `(offset, byte count)` per tile, in row-major order.
     tiles: Vec<(u64, u64)>,
 }
