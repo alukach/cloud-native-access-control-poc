@@ -1,0 +1,97 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; font: 400 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+           background: #e9edf3; color: #131922; -webkit-font-smoothing: antialiased; }
+    a { color: #1f5fbf; } a:hover { color: #174892; }
+    .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+  </style>
+</helmet>
+
+<div style="width: 1200px; min-height: 880px; background: #e9edf3;">
+
+  <div style="display: flex; align-items: center; gap: 16px; padding: 8px 24px; border-bottom: 1px solid #c6cfdc; background: #fbfcfe; font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #7b8697;">
+    <strong style="color: #131922; font-weight: 600;">cloud-native-access-control</strong>
+    <span>cnac 0.1.0 · wasm</span><span>parquet 206, identity</span><span>cog 206, identity</span>
+    <a href="#" style="margin-left: auto;">source</a>
+  </div>
+
+  <div style="padding: 28px 24px 40px;">
+    <h1 style="font-size: 24px; font-weight: 600; letter-spacing: -0.015em; line-height: 1.2; margin: 0 0 12px;">Access control on part of a file</h1>
+    <p style="margin: 0 0 28px; max-width: 68ch; color: #55606f;">Two real readers fetch two real files over HTTP range requests. Every range they ask for is resolved to the column chunks or image tiles it lands in, and checked against the CQL2 policy below before it is fetched.</p>
+
+    <div style="display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 24px;">
+
+      <div style="background: #fbfcfe; border: 1px solid #c6cfdc; border-radius: 3px;">
+        <div style="display: flex; justify-content: space-between; align-items: baseline; padding: 12px 14px; border-bottom: 1px solid #dbe2ec;">
+          <h2 style="font-size: 18px; font-weight: 600; margin: 0;">Policy</h2>
+          <span class="mono" style="font-size: 11px; color: #7b8697;">13 queryable properties</span>
+        </div>
+        <div style="padding: 14px;">
+          <div class="mono" style="background: #e2e7ef; border: 1px solid #dbe2ec; border-radius: 3px; padding: 10px; font-size: 11px; line-height: 1.7; color: #131922; height: 150px; overflow: hidden;">allow:<br>&nbsp;&nbsp;- "region.kind = 'metadata'"<br>&nbsp;&nbsp;- "region.kind = 'column_chunk' AND reg…<br>&nbsp;&nbsp;- "region.kind = 'tile' AND region.over…<br>&nbsp;&nbsp;- "user.role = 'analyst' AND region.kin…</div>
+          <div style="margin-top: 8px; padding: 8px 10px; background: #cfe0f8; border-left: 2px solid #1f5fbf; border-radius: 2px; font-size: 12px; color: #55606f;">Loaded. 4 rules, every property checked against the queryables schema.</div>
+          <div style="margin: 16px 0 8px; font-size: 12px; color: #7b8697;">Start from</div>
+          <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+            <span style="border: 1px solid #c6cfdc; border-radius: 3px; padding: 5px 9px; font-size: 12px; background: #fbfcfe;">Column mask and licensed area</span>
+            <span style="border: 1px solid #c6cfdc; border-radius: 3px; padding: 5px 9px; font-size: 12px; background: #fbfcfe;">Everything allowed</span>
+            <span style="border: 1px solid #c6cfdc; border-radius: 3px; padding: 5px 9px; font-size: 12px; background: #fbfcfe;">Data rules, no metadata rule</span>
+          </div>
+        </div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 24px;">
+        <div style="background: #fbfcfe; border: 1px solid #c6cfdc; border-radius: 3px;">
+          <div style="padding: 12px 14px; border-bottom: 1px solid #dbe2ec;"><h2 style="font-size: 18px; font-weight: 600; margin: 0;">Read alignment</h2></div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0; padding: 14px;">
+            <div style="border: 1px solid #c6cfdc; border-right: none; border-radius: 3px 0 0 3px; padding: 10px 12px;"><div style="font-size: 13px; font-weight: 600;">Library defaults</div><div class="mono" style="font-size: 11px; color: #7b8697;">hyparquet: no projection · geotiff: 64 KB blocks</div></div>
+            <div style="border: 1px solid #1f5fbf; background: #cfe0f8; border-radius: 0 3px 3px 0; padding: 10px 12px;"><div style="font-size: 13px; font-weight: 600;">Boundary-aligned</div><div class="mono" style="font-size: 11px; color: #55606f;">hyparquet: columns[] · geotiff: no blocking</div></div>
+          </div>
+        </div>
+
+        <div style="background: #fbfcfe; border: 1px solid #c6cfdc; border-radius: 3px;">
+          <div style="display: flex; justify-content: space-between; align-items: baseline; padding: 12px 14px; border-bottom: 1px solid #dbe2ec;">
+            <h2 style="font-size: 18px; font-weight: 600; margin: 0;">Parquet · 8 row groups × 19 columns</h2>
+            <span class="mono" style="font-size: 11px; color: #7b8697;">nyc-taxi-8rg.parquet · 8.42 MB · 291 regions</span>
+          </div>
+          <div style="padding: 14px;">
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+              <div>
+                <div style="display: flex; justify-content: space-between; font-size: 12px; color: #7b8697; border-bottom: 1px solid #dbe2ec; padding-bottom: 6px;"><span style="font-weight: 600; color: #131922;">Library defaults</span><span>coalesced</span></div>
+                <div style="display: flex; justify-content: space-between; padding: 7px 0; font-size: 13px;"><span>Ranges issued</span><span class="mono" style="font-size: 18px;">10</span></div>
+                <div style="display: flex; justify-content: space-between; padding: 7px 0; font-size: 13px;"><span>Straddling a boundary</span><span class="mono" style="font-size: 18px; color: #9c2b86;">8</span></div>
+                <div style="display: flex; justify-content: space-between; padding: 7px 0; font-size: 13px; border-bottom: 1px solid #dbe2ec;"><span>Bytes fetched</span><span class="mono" style="font-size: 18px;">15.9 kB</span></div>
+                <div style="margin-top: 10px; font-size: 12px; font-weight: 600; color: #b3560c;">QUERY FAILED</div>
+                <div style="font-size: 12px; color: #55606f;">Refused bytes=4-1071956, which covers 19 regions.</div>
+              </div>
+              <div style="border-left: 2px solid #1f5fbf; padding-left: 16px;">
+                <div style="display: flex; justify-content: space-between; font-size: 12px; color: #7b8697; border-bottom: 1px solid #dbe2ec; padding-bottom: 6px;"><span style="font-weight: 600; color: #131922;">Boundary-aligned</span><span>one structure per range</span></div>
+                <div style="display: flex; justify-content: space-between; padding: 7px 0; font-size: 13px;"><span>Ranges issued</span><span class="mono" style="font-size: 18px;">34</span></div>
+                <div style="display: flex; justify-content: space-between; padding: 7px 0; font-size: 13px;"><span>Straddling a boundary</span><span class="mono" style="font-size: 18px;">0</span></div>
+                <div style="display: flex; justify-content: space-between; padding: 7px 0; font-size: 13px; border-bottom: 1px solid #dbe2ec;"><span>Bytes fetched</span><span class="mono" style="font-size: 18px;">1.41 MB</span></div>
+                <div style="margin-top: 10px; font-size: 12px; font-weight: 600; color: #1f5fbf;">QUERY COMPLETED</div>
+                <div style="font-size: 12px; color: #55606f;">400,000 rows decoded from 4 projected columns.</div>
+              </div>
+            </div>
+            <div style="margin-top: 18px; height: 26px; background: #cfe0f8; border: 1px solid #dbe2ec; border-radius: 2px; position: relative;">
+              <div style="position: absolute; left: 12%; width: 3%; top: 0; bottom: 0; background: #131922;"></div>
+              <div style="position: absolute; left: 31%; width: 3%; top: 0; bottom: 0; background: #131922;"></div>
+              <div style="position: absolute; left: 55%; width: 3%; top: 0; bottom: 0; background: #131922;"></div>
+              <div style="position: absolute; left: 74%; width: 4%; top: 0; bottom: 0; background: #f7dfc4;"></div>
+            </div>
+            <div class="mono" style="display: flex; justify-content: space-between; font-size: 10px; color: #7b8697; margin-top: 3px;"><span>byte 0</span><span>the whole object, 8.42 MB, coloured by verdict</span><span>8422357</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

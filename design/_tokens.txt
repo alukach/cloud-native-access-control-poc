@@ -1,0 +1,5 @@
+--paper #e9edf3 / --surface #fbfcfe / --sunk #e2e7ef / --rule #c6cfdc / --rule-soft #dbe2ec
+--ink #131922 / --ink-2 #55606f / --ink-3 #7b8697
+--allow #1f5fbf / --allow-soft #cfe0f8 / --deny #b3560c / --deny-soft #f7dfc4
+--straddle #9c2b86 / --straddle-soft #f2d4ec / --neutral #aab4c2
+radius 3px, mono ui-monospace/SF Mono/Menlo, sans system-ui

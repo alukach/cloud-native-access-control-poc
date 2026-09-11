@@ -1,0 +1,13 @@
+{
+  "artboards": [
+    { "file": "Current.dc.html", "x": 0, "y": 0, "w": 1200, "h": 880, "title": "Today" },
+    { "file": "Main.dc.html", "x": 1320, "y": 0, "w": 1440, "h": 980, "title": "Workbench" }
+  ],
+  "annotations": [
+    { "id": "brief", "x": 0, "y": -250, "w": 600, "text": "Third pass. Two changes since last time.\n\n1 — The query is now something you build. A row of column chips is the SELECT clause; picking them is how you decide what the reader fetches. Previously the four columns were hardcoded in presets.js and there was no way to change them, which is why \"the reader asked for this file in 10 requests\" came out of nowhere.\n\n2 — The toggle is gone. It implied alignment is a setting. It is a property of the client, so the readers are now rows on one axis and you see all of them at once." },
+    { "id": "flow", "x": 1320, "y": -180, "w": 430, "text": "The page reads as three numbered steps:\n\n1 what you ask for  (the query)\n2 what you may read  (policy + principal)\n3 what each reader actually fetched\n\nThat ordering is the argument. Steps 1 and 2 are independent; step 3 is what falls out of them, and the client is the variable nobody controls." },
+    { "id": "duck", "x": 1800, "y": -180, "w": 400, "text": "The DuckDB row is drawn as pending on purpose — I do not yet know if its range requests can be intercepted from JS, since it fetches from inside WASM. That is being measured now.\n\nIf it cannot be intercepted, the row comes out and the axis is two hyparquet configurations. If it can, this becomes the most useful line on the page: DuckDB is what people actually point at Parquet." },
+    { "id": "open", "x": 1320, "y": 1050, "w": 560, "text": "Open, and worth your call:\n\n• The column chips double as the projection control. Picking columns IS what makes hyparquet align. So \"query\" and \"fetch plan\" are the same knob for that reader — honest, but it means the second row is not a setting you toggle, it is what happens when a reader honours your projection.\n\n• The COG side needs the same treatment: AOI drawn on the tile grid instead of three preset buttons, and the same reader-rows picture with tiles instead of chunks. Not drawn yet.\n\n• Row count is a slider here. It may not earn its space — projection is what moves the numbers, rows barely do." }
+  ],
+  "launch": { "view": "canvas" }
+}
