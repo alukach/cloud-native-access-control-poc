@@ -6,11 +6,13 @@ A proof of concept for column-level and area-level access control over
 Parquet, COG, Zarr and Icechunk — enforced at an S3 gateway, using
 [CQL2](https://docs.ogc.org/is/21-065r2/21-065r2.html) as the rule language.
 
-> **Status: design complete, implementation not started.**
-> This repository exists to decide whether
-> [multistore](https://github.com/developmentseed/multistore) should adopt this
-> approach. It is not production software and enforces nothing today.
-> See [the design document](docs/plans/2026-09-10-cloud-native-access-control-design.md).
+> **Status: the Rust crate works; the browser demo is being built.**
+> Both resolvers parse real files, policies evaluate, and the decision
+> function is covered by 140 tests. This repository exists to decide whether
+> [multistore](https://github.com/developmentseed/multistore) should adopt the
+> approach — it is not production software and enforces nothing today.
+> See the [design](docs/plans/2026-09-10-cloud-native-access-control-design.md)
+> and [implementation plan](docs/plans/2026-09-10-cloud-native-access-control-plan.md).
 
 ## The problem
 
@@ -137,13 +139,84 @@ or the [`known-limitation`](https://github.com/alukach/cloud-native-access-contr
 and [`security`](https://github.com/alukach/cloud-native-access-control-poc/labels/security)
 labels specifically.
 
+## Running it locally
+
+**Prerequisites:** Rust (the exact compiler is pinned in `rust-toolchain.toml`
+and `rustup` installs it automatically). For the browser demo you also need
+[`wasm-pack`](https://rustwasm.github.io/wasm-pack/installer/).
+
+### The crate
+
+```sh
+cargo test          # 140 tests; the test names are the specification
+cargo clippy --all-targets -- -D warnings
+```
+
+The tests are the most honest picture of what this does. They run against the
+real sample files in `data/` and the adversarial fixtures in `tests/fixtures/`,
+not synthetic data — `tests/fixtures/README.md` says what each file is for and
+which failure it is there to catch.
+
+Worth reading by name, since each pins a bug that would otherwise have shipped:
+
+| test | what it defends |
+| --- | --- |
+| `a_conjunctive_decision_over_an_empty_result_is_vacuously_true` | why `LayoutIndex` fills gaps at all |
+| `a_tile_region_includes_its_gdal_leader_and_trailer` | otherwise every COG tile request is denied |
+| `whitespace_is_rejected_not_trimmed` | the RFC 9110 lenient-parse bypass |
+| `a_typo_is_rejected_inside_every_container_variant` | CQL2 property typos that fail open |
+| `end_at_u64_max_clamps_instead_of_overflowing` | wraps to `0..0` in release, panics in debug |
+
+### The demo
+
+```sh
+wasm-pack build --release --target web --out-dir web/pkg
+npx serve .                        # from the repository root
+# then open the printed URL and append /web/
+```
+
+Serve from the repository root, not from `web/` — the page reads the sample
+files in `data/`.
+
+> **Do not use `python3 -m http.server`.** It ignores `Range` entirely and
+> answers `200` with the whole file (measured: a request for 20 bytes returns
+> all 8,422,357). The demo would fetch 8 MB where it asked for 8 KB and
+> mis-parse it. This is exactly the RFC 9110 §14.2 behaviour described above,
+> and a good illustration of why a gateway must verify `Content-Range` on the
+> response rather than trusting that its request was honoured.
+
+Any server that implements byte ranges will do. Two that are already on most
+machines, both verified to return `206 Partial Content` here:
+
+```sh
+npx serve .                   # Node
+ruby -run -e httpd . -p 8000  # Ruby, no install needed on macOS
+```
+
+### Regenerating the sample data
+
+Only needed if you change the fixtures. Requires `duckdb` and `gdal`:
+
+```sh
+./scripts/make-fixtures.sh all      # or: demo | fixtures | verify
+```
+
+The script re-measures every property it claims rather than asserting it, and
+explains why each flag matters. The scene choice for the COG is load-bearing:
+a full-coverage Sentinel-2 granule yields ~76 KB per tile, so no tile ever
+shares a 64 KB block with another and the coalescing this project measures
+cannot occur. Do not substitute an arbitrary `TCI.tif`.
+
 ## Layout
 
 ```
-src/          Rust: resolvers, policy evaluation, wasm bindings
-web/          static demo for GitHub Pages
-data/         sample Parquet and COG
-docs/plans/   design and implementation plan
+src/              Rust: range parsing, layout index, policy, decision, resolvers
+web/              static demo for GitHub Pages (web/pkg/ is built, gitignored)
+data/             sample Parquet and COG, sized so coalescing actually bites
+tests/fixtures/   small adversarial files, one per edge case
+scripts/          fixture regeneration
+docs/plans/       design and implementation plan
+.github/          CI, and the Pages deploy that asserts range support
 ```
 
 ## License
