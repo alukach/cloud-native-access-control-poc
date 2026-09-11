@@ -1,3 +1,4 @@
+pub mod cog;
 pub mod decision;
 pub mod index;
 pub mod parquet;
