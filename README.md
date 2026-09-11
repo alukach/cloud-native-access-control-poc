@@ -121,16 +121,72 @@ unclassified bytes and gets denied.
 and the dictionary page falls outside every region — and for a low-cardinality
 column, the dictionary page *is* the set of distinct values.
 
+## Footer rewrite + scrub: the mode that works for every client
+
+Refusing ranges is honest and it cannot serve a block-aligned reader. The fix is
+to stop arguing with the client's I/O layer: serve a **valid Parquet file whose
+footer never mentions the withheld columns**, leaving their bytes physically in
+place but **zeroed**. Coalescing becomes harmless, because nothing parses the
+hole.
+
+`src/rewrite.rs` builds both halves from the *same* `LayoutIndex` the refusal
+path uses — `ColumnChunk`, `ColumnIndex` and `BloomFilter` are exactly the
+extents a withheld column owns. `examples/gate.rs` serves it over HTTP from one
+file handle plus the rewritten ~14 KB tail; the object is never materialized.
+
+Measured on `data/nyc-taxi-8rg.parquet`, withholding `fare_amount` and
+`tip_amount`, against a client that widens every read to whole 64 KiB blocks —
+which is what duckdb-wasm and GDAL `/vsicurl` do:
+
+| mode | result | requests | straddling a withheld extent |
+| --- | --- | ---: | --- |
+| `refuse` | **failed on request #1** — 403 on the tail read | 1 | 1, refused |
+| `rewrite` + `scrub` | **OK**, 400,000 rows, correct sums | 33 | **31, all served** |
+
+31 of 33 reads span withheld bytes and none of them matter. DuckDB 1.4.1 over
+`httpfs` returns `md5 = 56ecb5901d6327f22af12281188edaae` over all 400,000 rows
+× 17 surviving columns — **byte-identical to the original file**; parquet-rs
+59.3 full-scans it; the withheld column is a binder error rather than nulls.
+
+The address map is two cases, which is what makes it servable from a proxy:
+`footer_start` is unchanged and every byte below it keeps its offset, so a
+virtual offset is either the same physical offset (scrubbed) or an index into
+the resident tail. The virtual length goes in `HEAD`/`Content-Length` and in
+every `Content-Range` complete-length.
+
+Three things this costs, all of them real:
+
+- **The origin's `ETag`, `Content-MD5` and `ListObjects` size all disagree with
+  what you serve.** `Rewrite::etag` synthesizes a validator over the rewritten
+  tail, the scrub set and the original length — the same for every principal
+  whose policy withholds the same columns, so many principals collapse onto one
+  cache entry. Clients must not be allowed to revalidate against the origin.
+- **`ARROW:schema` has to be stripped**, and stripping is lossy: arrow type
+  fidelity that lives only in that flatbuffer — timezones, extension types,
+  dictionary encoding — does not survive. Leaving it in is both a plaintext
+  leak of every original column name and a hard failure in arrow-rs
+  (`incompatible arrow schema, expected 2 struct fields got 4`).
+- **Scrubbing is mandatory, not optional.** With the footer rewritten and
+  nothing else done, `Range: bytes=863208-863247` still returns live SNAPPY
+  pages of the withheld column. `--mode rewrite` exists so that can be
+  demonstrated rather than described.
+
+This closes [#16](https://github.com/alukach/cloud-native-access-control-poc/issues/16)
+for the rewrite path: the served footer contains zero chunks for the withheld
+columns — no statistics, no bloom-filter pointers, no page-index pointers, and
+no name anywhere in the 14 KB tail.
+
 ## What this does not do
 
 This reduces access and enforces licensing. **It is not confidentiality, and it
 is not an access gate** — it's a sub-object filter that presumes an
 object-level decision made elsewhere.
 
-- **Metadata is served intact.** A denied column still reveals its name, type
-  and size. Footer statistics, the page index and bloom filters leak values —
-  per *page* (~20k rows), not per row group. Hiding that a column exists needs
-  footer rewriting, which is out of scope.
+- **Under `DenialMode::Refuse`, metadata is served intact.** A denied column
+  still reveals its name, type and size. Footer statistics, the page index and
+  bloom filters leak values — per *page* (~20k rows), not per row group. Footer
+  rewrite removes all of that, at the cost of the ETag and arrow-fidelity
+  problems above.
 - **The AOI is recoverable.** Probing tile ranges and watching 403 versus 206
   recovers the licensed boundary at tile granularity. The AOI is often itself
   the sensitive thing.
@@ -157,7 +213,7 @@ and `rustup` installs it automatically). For the browser demo you also need
 ### The crate
 
 ```sh
-cargo test          # 140 tests; the test names are the specification
+cargo test          # 183 tests; the test names are the specification
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -175,6 +231,28 @@ Worth reading by name, since each pins a bug that would otherwise have shipped:
 | `whitespace_is_rejected_not_trimmed` | the RFC 9110 lenient-parse bypass |
 | `a_typo_is_rejected_inside_every_container_variant` | CQL2 property typos that fail open |
 | `end_at_u64_max_clamps_instead_of_overflowing` | wraps to `0..0` in release, panics in debug |
+| `the_codec_reproduces_every_fixture_footer_byte_for_byte` | the round-trip identity every footer rewrite rests on |
+| `withholding_a_groups_only_leaf_prunes_the_group_rather_than_emptying_it` | `num_children=0` silently reshapes the schema |
+
+### The gateway
+
+```sh
+cargo run --release --example gate -- \
+    --file data/nyc-taxi-8rg.parquet \
+    --policy examples/withhold-fares.yaml \
+    --user '{"role":"analyst"}' \
+    --port 8899 --mode scrub        # or: rewrite, refuse
+```
+
+It prints the plan as JSON — which columns went, which region kinds the policy
+denied, how many bytes are scrubbed, which schema groups were pruned, which
+`key_value_metadata` keys were stripped — then serves
+`http://127.0.0.1:8899/f.parquet` to any reader. `--mode refuse` serves the
+original object through `decision::check` instead, so the same client can be
+run against both.
+
+Never serve the sample files with `python3 -m http.server`: it ignores `Range`
+and returns the whole object, which makes every measurement meaningless.
 
 ### The demo
 
@@ -212,7 +290,8 @@ supports both (`DenialMode`); the page currently runs refuse-only and says so.
 Which one you need is not a preference — it depends on the client. A projecting
 engine never parses the blanked bytes, so zero-fill is lossless for it; a client
 that reads every column parses the zeros and gets corrupt data instead of a
-clean refusal.
+clean refusal. Footer rewrite removes the dependence on the client entirely, by
+making the withheld columns invisible rather than forbidden — see above.
 
 > **Do not use `python3 -m http.server`.** It ignores `Range` entirely and
 > answers `200` with the whole file (measured: a request for 20 bytes returns
@@ -274,7 +353,9 @@ cannot occur. Do not substitute an arbitrary `TCI.tif`.
 ## Layout
 
 ```
-src/              Rust: range parsing, layout index, policy, decision, resolvers
+src/              Rust: range parsing, layout index, policy, decision, resolvers,
+                  and rewrite.rs (footer rewrite + scrub)
+examples/         gate.rs, an HTTP gateway serving a filtered view of a file
 web/              static demo for GitHub Pages (web/pkg/ is built, gitignored)
 data/             sample Parquet and COG, sized so coalescing actually bites
 tests/fixtures/   small adversarial files, one per edge case

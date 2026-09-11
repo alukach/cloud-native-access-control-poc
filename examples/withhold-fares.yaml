@@ -1,0 +1,25 @@
+# The licence this gateway enforces: every column but `fare_amount` and
+# `tip_amount`.
+#
+# Written as two rules on purpose.
+allow:
+  # The structure. `magic`, `footer` and `footer_trailer` are the only names
+  # the Parquet resolver emits, and without them no reader can find anything.
+  # `rewrite::plan` never asks about these -- it serves the structure
+  # unconditionally, because a representation that withheld it would not be a
+  # Parquet file -- but `--mode refuse` does, and the same policy has to work
+  # in both so the comparison is honest.
+  - "region.kind = 'metadata'"
+
+  # Every column except the two, across ALL THREE of its region kinds:
+  # `column_chunk`, `column_index` and `bloom_filter`. Spelling it as one rule
+  # about `region.column` rather than three about `region.kind` is what makes
+  # that automatic.
+  #
+  # Permitting only the chunks would be the trap issue #26 measured: DuckDB
+  # parses bloom filters for equality predicates and fails with a
+  # corruption-shaped error when they are missing, and pyarrow's fixed 64 KiB
+  # footer probe reaches back over them. `rewrite::plan` fails closed on such a
+  # policy -- it withholds the whole column and says so -- but the right fix is
+  # to write the rule about the column.
+  - "region.column <> 'fare_amount' AND region.column <> 'tip_amount'"
