@@ -160,20 +160,48 @@ pub enum Decision {
 ///
 /// # Why a second mode exists at all
 ///
-/// Measured against `data/nyc-taxi-8rg.parquet`: DuckDB pushes projection down
-/// (2 of 19 columns, 11.9% of the object) and prunes row groups by footer
-/// statistics, but its physical reads are **16 KiB / 64 KiB power-of-two
-/// aligned blocks, not chunk extents**. 27 of its 27 content requests straddle
-/// a column chunk it never projected. Deny `extra` and `SELECT fare_amount`
-/// is refused because `extra` is physically adjacent; deny `extra` and
-/// `SELECT VendorID` succeeds. *Adjacency in the file decides, not the query.*
+/// Whether [`DenialMode::Refuse`] works is a property of the client's **I/O
+/// layer**, not of the format and not of object-storage latency. Measured
+/// against `data/nyc-taxi-8rg.parquet` with a policy withholding two columns:
 ///
-/// So [`DenialMode::Refuse`] cannot serve DuckDB at all under any policy that
-/// withholds a column sitting within 64 KiB of a permitted one, and that is
-/// not a client misconfiguration a deployment can fix. Zero-fill is therefore
-/// not a degraded fallback: for a projecting reader it is lossless, because
-/// the blanked bytes are never parsed -- they are only along for the ride
-/// inside the block.
+/// | client | reads | straddles |
+/// | --- | --- | --- |
+/// | DuckDB native CLI | chunk extents, merging only across *needed* chunks within 16 KiB | 0 |
+/// | pyarrow, either `pre_buffer` mode | chunk extents | 0 |
+/// | duckdb-wasm | 16/64 KiB power-of-two blocks | 27 of 27 |
+/// | anything behind GDAL `/vsicurl` | 16 KiB-aligned block cache | 2 of 3 |
+///
+/// The native CLI issued `bytes=840537-863207` where the withheld
+/// `fare_amount@rg0` ends at exactly 840537 and the withheld `tip_amount@rg0`
+/// begins at exactly 863208 -- it coalesced the two chunks it needed and
+/// stopped dead on both forbidden boundaries. Its 16 KiB merge window is a
+/// compile-time constant (bisected: 15770 B merges, 16408 B does not;
+/// unchanged under 80 ms injected latency) and never extends past the
+/// outermost needed chunk.
+///
+/// So `Refuse` serves the dominant server-side Parquet clients today with no
+/// false denials. It cannot serve a client reading through a block-aligned
+/// cache -- and for GDAL `/vsicurl` no configuration fixes that:
+/// `GDAL_HTTP_MERGE_CONSECUTIVE_RANGES=NO` and `GDAL_HTTP_MULTIRANGE=NO` have
+/// no effect, and `CPL_VSIL_CURL_CHUNK_SIZE` only resizes the grid, which
+/// still cannot land on tile boundaries. Note the alignment belongs to the
+/// transport: pyarrow is chunk-exact standalone and block-aligned when the
+/// same reader is driven through `/vsicurl`.
+///
+/// Zero-fill is the mode for those clients. For a reader that does not parse
+/// what it did not project it is lossless -- verified for DuckDB, where a
+/// 64 KiB block arriving 99.5% zeroed still returned 400,000 rows
+/// byte-identical to an unrestricted run.
+///
+/// A policy must permit the `column_index` and `bloom_filter` regions of every
+/// column it permits. DuckDB parses bloom filters for equality predicates, and
+/// pyarrow's fixed 64 KiB footer probe reaches back over them; withholding
+/// them costs pyarrow one straddle per query and breaks DuckDB equality
+/// predicates with a corruption-shaped error rather than a policy denial.
+///
+/// Do not recommend DuckDB's `disable_parquet_prefetching`: it disables the
+/// exact-chunk planner and falls back to 1 MB buffered reads, taking a clean
+/// client to 8 of 10 straddling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DenialMode {
     /// Refuse any range covering a forbidden byte.
