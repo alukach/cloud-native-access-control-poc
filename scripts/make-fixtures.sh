@@ -9,7 +9,28 @@
 #   ./scripts/make-fixtures.sh verify     # re-verify what is already on disk
 #
 # Requires `duckdb`, `gdal_translate`, `gdalinfo`, `curl` and `python3` on
-# PATH. Nothing else -- deliberately no pyarrow and no rasterio.
+# PATH, plus -- for the two fixtures DuckDB physically cannot produce -- two
+# pinned pyarrow interpreters, named by $PYARROW11 and $PYARROW. Both parquet
+# steps are SKIPPED with a warning when those are unset, so the rest of the
+# script still runs on a machine with neither.
+#
+# The pyarrow dependency was resisted and is now load-bearing. Every Parquet
+# fixture in this repository used to come from DuckDB, and a resolver tested
+# only against its own writer's output is a test that passes because the
+# fixture and the code share an author -- which is exactly how issue #23
+# survived: 495 unclassified spans in a Hugging Face file, zero in everything
+# committed here. DuckDB emits no page index and no inline `ColumnMetaData`, so
+# no DuckDB flag reaches either shape.
+#
+#   PYARROW11  a python with pyarrow 11.0.0 -- the LAST parquet-cpp that wrote
+#              a copy of each chunk's ColumnMetaData into the data stream.
+#              Arrow 12 stopped, so a current pyarrow cannot make this file:
+#                uv venv --python 3.11 .venv311
+#                uv pip install --python .venv311/bin/python \
+#                    'pyarrow==11.0.0' 'numpy<2'
+#   PYARROW    any python with pyarrow >= 13, for `write_page_index=True`,
+#              which pyarrow 11 has no parameter for:
+#                python3 -m venv .venv && .venv/bin/pip install pyarrow
 #
 # Nothing large is ever written into the repository. The Parquet sources are
 # read straight over HTTPS by DuckDB's httpfs (which range-requests only the
@@ -184,6 +205,62 @@ make_parquet_fixtures() {
     TO '$FIX/multi-rg.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 2048);"
 }
 
+# Two Parquet fixtures from a writer that is not DuckDB. See the header for why
+# this needs two pinned pyarrow versions and why neither shape is reachable
+# from DuckDB.
+make_foreign_parquet_fixtures() {
+  log "tests/fixtures/{inline-colmeta,page-index}.parquet"
+  mkdir -p "$FIX"
+
+  # The same 2000-row, 3-column table in both, at 500 rows per row group, so
+  # the two files differ ONLY in the writer and its options. `region_code` has
+  # four distinct values so parquet-cpp dictionary-encodes it; `id` and `value`
+  # are high-cardinality and stay PLAIN. 12 chunks either way.
+  local table
+  table=$(cat <<'PY'
+import pyarrow as pa, pyarrow.parquet as pq, sys
+t = pa.table({'id': pa.array(range(2000), pa.int32()),
+              'region_code': pa.array([['alpha','beta','gamma','delta'][i%4]
+                                       for i in range(2000)]),
+              'value': pa.array([float(i) for i in range(2000)])})
+kw = {}
+if sys.argv[2] == 'page_index':
+    kw['write_page_index'] = True
+pq.write_table(t, sys.argv[1], row_group_size=500, compression='snappy',
+               write_statistics=True, **kw)
+print(pq.ParquetFile(sys.argv[1]).metadata.created_by)
+PY
+)
+
+  # inline-colmeta.parquet -- parquet-cpp writes a copy of each chunk's
+  # `ColumnMetaData` thrift into the data stream, immediately after that
+  # chunk's last page, and points `ColumnChunk.file_offset` at it. Nothing
+  # records its LENGTH, so a resolver that maps only
+  # `min(dict, data) .. + total_compressed_size` leaves one unclassified span
+  # per chunk -- ~80 bytes each here, ~92 in the Hugging Face file this was cut
+  # down from. Unmapped denies, so those spans denied every read that straddled
+  # one; worse, the structure names the column and carries its chunk-level min
+  # and max, so it survived `rewrite`'s by-column scrub in plaintext. Arrow 12
+  # stopped writing it, which is why the pin is to 11.0.0 and not to "pyarrow".
+  if [ -n "${PYARROW11:-}" ]; then
+    "$PYARROW11" -c "$table" "$FIX/inline-colmeta.parquet" plain
+  else
+    echo "SKIP inline-colmeta.parquet: \$PYARROW11 unset" >&2
+  fi
+
+  # page-index.parquet -- a real ColumnIndex and OffsetIndex per chunk, written
+  # because the writer was asked to rather than because a test built one
+  # in-process. DuckDB emits NEITHER, so before this file the only coverage of
+  # the page-index path was a synthetic arrow-rs file built inside
+  # `src/parquet.rs`. parquet-cpp also lays them out differently from arrow-rs:
+  # every ColumnIndex first, then every OffsetIndex, after the last row group.
+  if [ -n "${PYARROW:-}" ]; then
+    "$PYARROW" -c "$table" "$FIX/page-index.parquet" page_index
+  else
+    echo "SKIP page-index.parquet: \$PYARROW unset" >&2
+  fi
+}
+
 make_tiff_fixtures() {
   log "tests/fixtures/*.tif"
   mkdir -p "$FIX"
@@ -223,6 +300,25 @@ make_tiff_fixtures() {
     -co TILED=YES -co BLOCKXSIZE=64 -co BLOCKYSIZE=64 -co INTERLEAVE=BAND \
     -co COMPRESS=DEFLATE -co PREDICTOR=2 -co ZLEVEL=9 \
     "$src" "$FIX/planar2.tif"
+
+  # odd-tag.tif -- tiny-cog.tif plus one metadata item, chosen so that the
+  # ASCII `GDAL_METADATA` value (tag 42112) comes out an ODD number of bytes.
+  # TIFF requires every value to begin on a word boundary, so the next value is
+  # preceded by one filler byte that belongs to no structure -- and a resolver
+  # that maps a value as exactly its length leaves that byte `Unmapped`, in the
+  # middle of the metadata prefix, which denies the header read every reader
+  # makes first. This is not a contrived shape: every COG on
+  # sentinel-cogs.s3.us-west-2.amazonaws.com is written this way, and
+  # S2A_10SEG_20240923_0_L2A/TCI.tif measured exactly one unmapped byte at
+  # 1303. `-mo NOTE=odd` is the smallest edit that reproduces it in 19 KB.
+  #
+  # If `verify` reports zero unmapped-capable padding here, change the length
+  # of the NOTE value by one and re-run: the parity of the GDAL_METADATA XML is
+  # what the fixture is FOR, and GDAL will happily produce an even one.
+  gdal_translate -q -of COG "${SRCWIN[@]}" \
+    -co BLOCKSIZE=64 -co COMPRESS=JPEG -co QUALITY=75 -co OVERVIEWS=IGNORE_EXISTING \
+    -mo "NOTE=odd" \
+    "$src" "$FIX/odd-tag.tif"
 
   # tiny-cog.tif -- the happy path, for golden offsets. BLOCKSIZE=64 against a
   # 256x256 window gives 4x4 base tiles and two overview levels (2x2, 1x1);
@@ -285,6 +381,17 @@ verify() {
     FROM parquet_metadata('$FIX/multi-rg.parquet')
     GROUP BY row_group_id ORDER BY row_group_id;"
 
+  log "verify: inline-colmeta.parquet -- expect created_by parquet-cpp-arrow 11, and a GAP after every chunk"
+  duckdb -c "
+    SELECT created_by FROM parquet_file_metadata('$FIX/inline-colmeta.parquet');"
+  inline_gaps "$FIX/inline-colmeta.parquet"
+
+  log "verify: page-index.parquet -- expect a ColumnIndex AND an OffsetIndex for all 12 chunks"
+  page_index_extent "$FIX/page-index.parquet"
+
+  log "verify: odd-tag.tif -- expect an ODD-length value for tag 42112, so the next value is preceded by a pad byte"
+  tag_value_padding "$FIX/odd-tag.tif"
+
   log "verify: striped.tif -- expect STRIPED (no TileOffsets); planar2.tif -- expect planar=2 with 3x the tile grid"
   tiff_structure "$FIX/striped.tif" "$FIX/planar2.tif" "$FIX/tiny-cog.tif"
 
@@ -292,6 +399,106 @@ verify() {
   gdalinfo "$FIX/tiny-cog.tif" | grep -E 'LAYOUT|Overviews:' || true
   head -c 200 "$FIX/tiny-cog.tif" | strings | grep -E 'BLOCK_LEADER|BLOCK_TRAILER|LAYOUT' || true
   cog_leader_trailer "$FIX/tiny-cog.tif"
+}
+
+# The gap between the end of each column chunk and the start of the next, and
+# whether that gap begins exactly at the chunk's `file_offset`. For a
+# parquet-cpp file every one of them does, and the gap holds that chunk's
+# inline `ColumnMetaData`.
+#
+# This looks only at chunks, so a DuckDB file reports one gap -- the bloom
+# filter block between the last chunk and the footer, which the resolver maps
+# from `bloom_filter_offset`. What matters is `gaps_at_file_offset`: 0 for
+# DuckDB, one per chunk for parquet-cpp.
+inline_gaps() {
+  duckdb -c "
+    WITH extent AS (
+      SELECT least(coalesce(dictionary_page_offset, data_page_offset),
+                   data_page_offset) AS start,
+             total_compressed_size AS len, file_offset
+      FROM parquet_metadata('$1')),
+    ordered AS (
+      -- The last chunk's gap runs to the footer, not to a next chunk, and it
+      -- is a gap like any other: coalesce rather than let `lead` drop it.
+      SELECT start + len AS chunk_end, file_offset,
+             coalesce(lead(start) OVER (ORDER BY start),
+                      (SELECT file_size_bytes - footer_size - 8
+                       FROM parquet_file_metadata('$1'))) AS next_start
+      FROM extent)
+    SELECT count(*) AS chunks,
+           count(*) FILTER (next_start > chunk_end) AS gaps,
+           coalesce(sum(next_start - chunk_end)
+                    FILTER (next_start > chunk_end), 0) AS gap_bytes,
+           count(*) FILTER (next_start > chunk_end
+                            AND file_offset = chunk_end) AS gaps_at_file_offset
+    FROM ordered;"
+  # The first gap, spelled out: the bytes really are a ColumnMetaData thrift,
+  # which is legible enough that the column name reads straight out of it.
+  python3 - "$1" <<'PY'
+import subprocess, sys
+q = ("SELECT least(coalesce(dictionary_page_offset, data_page_offset), "
+     "data_page_offset) + total_compressed_size, file_offset "
+     f"FROM parquet_metadata('{sys.argv[1]}') ORDER BY 1 LIMIT 1;")
+out = subprocess.run(['duckdb', '-csv', '-noheader', '-c', q],
+                     capture_output=True, text=True).stdout.strip()
+end, file_offset = (int(x) for x in out.split(','))
+d = open(sys.argv[1], 'rb').read()
+print(f'  first chunk ends at {end}, its file_offset is {file_offset}')
+print(f'  bytes there: {d[end:end+56]!r}')
+PY
+}
+
+# A page index is not visible to `parquet_metadata`, so this measures the space
+# it occupies: everything between the last column chunk and the footer.
+page_index_extent() {
+  duckdb -c "
+    WITH e AS (
+      SELECT max(least(coalesce(dictionary_page_offset, data_page_offset),
+                       data_page_offset) + total_compressed_size) AS data_end,
+             count(*) AS chunks
+      FROM parquet_metadata('$1')),
+    f AS (SELECT file_size_bytes, footer_size, created_by
+          FROM parquet_file_metadata('$1'))
+    SELECT created_by, chunks, data_end,
+           file_size_bytes - footer_size - 8 AS footer_start,
+           file_size_bytes - footer_size - 8 - data_end AS between_data_and_footer
+    FROM e, f;"
+  echo "  (the per-chunk offsets are asserted in src/parquet.rs::"
+  echo "   a_real_page_index_written_by_another_implementation_is_classified)"
+}
+
+# The parity of every out-of-line tag value, and therefore where TIFF's
+# word-alignment padding falls.
+tag_value_padding() {
+  python3 - "$1" <<'PY'
+import struct, sys
+
+TSZ = {1:1, 2:1, 3:2, 4:4, 5:8, 6:1, 7:1, 8:2, 9:4, 10:8, 11:4, 12:8, 13:4}
+d = open(sys.argv[1], 'rb').read()
+bo = '<' if d[:2] == b'II' else '>'
+off = struct.unpack(bo + 'I', d[4:8])[0]
+n = struct.unpack(bo + 'H', d[off:off+2])[0]
+values = []
+for i in range(n):
+    e = d[off + 2 + i*12 : off + 14 + i*12]
+    tag, typ = struct.unpack(bo + 'HH', e[:4])
+    cnt = struct.unpack(bo + 'I', e[4:8])[0]
+    size = TSZ.get(typ, 0) * cnt
+    if size > 4:
+        at = struct.unpack(bo + 'I', e[8:12])[0]
+        values.append((at, at + size, tag, size))
+values.sort()
+pads = 0
+for (a, b, tag, size), (na, _, ntag, _) in zip(values, values[1:]):
+    if na == b + 1:
+        pads += 1
+        print(f'  tag {tag}: {a}..{b} ({size} bytes, odd) then ONE pad byte at '
+              f'{b}, next value (tag {ntag}) at {na}')
+print(f'  {len(values)} out-of-line values in IFD 0, '
+      f'{pads} word-alignment pad byte(s)')
+if not pads:
+    raise SystemExit('  FAIL: this fixture exists for the pad byte and has none')
+PY
 }
 
 # Walk the IFD chain and report, per level, the tile/strip count and mean block
@@ -395,9 +602,10 @@ PY
 
 case "${1:-all}" in
   demo)     make_demo_parquet; make_demo_cog ;;
-  fixtures) make_parquet_fixtures; make_tiff_fixtures ;;
+  fixtures) make_parquet_fixtures; make_foreign_parquet_fixtures; make_tiff_fixtures ;;
   verify)   ;;
-  all)      make_demo_parquet; make_demo_cog; make_parquet_fixtures; make_tiff_fixtures ;;
+  all)      make_demo_parquet; make_demo_cog; make_parquet_fixtures
+            make_foreign_parquet_fixtures; make_tiff_fixtures ;;
   *)        echo "usage: $0 [all|demo|fixtures|verify]" >&2; exit 2 ;;
 esac
 

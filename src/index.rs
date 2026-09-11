@@ -64,6 +64,18 @@ pub enum RegionKind {
         column: String,
         row_group: usize,
     },
+    /// A copy of one chunk's `ColumnMetaData` thrift written into the data
+    /// stream, immediately after the chunk's pages, and addressed by the
+    /// deprecated `ColumnChunk.file_offset`. parquet-cpp wrote one after every
+    /// chunk until Arrow 12; files from that era are still being served.
+    ///
+    /// It is its own kind rather than [`RegionKind::Metadata`] because it is
+    /// **about one column**: it repeats that column's name, its encodings and
+    /// its chunk-level statistics -- the min and the max of the column, in
+    /// plaintext. A blanket `region.kind = 'metadata'` allow must not reach it.
+    ColumnMetadata {
+        column: String,
+    },
     ColumnIndex {
         column: String,
     },
@@ -114,6 +126,7 @@ impl Region {
     pub fn column(&self) -> Option<&str> {
         match &self.kind {
             RegionKind::ColumnChunk { column, .. }
+            | RegionKind::ColumnMetadata { column }
             | RegionKind::ColumnIndex { column }
             | RegionKind::BloomFilter { column } => Some(column),
             _ => None,
@@ -139,6 +152,9 @@ impl Region {
             RegionKind::Unmapped => json!({"kind":"unmapped"}),
             RegionKind::ColumnChunk { column, row_group } => {
                 json!({"kind":"column_chunk","column":column,"row_group":row_group})
+            }
+            RegionKind::ColumnMetadata { column } => {
+                json!({"kind":"column_metadata","column":column})
             }
             RegionKind::ColumnIndex { column } => {
                 json!({"kind":"column_index","column":column})

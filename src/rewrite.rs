@@ -1659,6 +1659,60 @@ mod tests {
         }
     }
 
+    /// Issue #23, from the scrub side. A parquet-cpp file repeats each chunk's
+    /// `ColumnMetaData` in the data stream, and that copy carries the column's
+    /// NAME and its chunk-level min and max in plaintext. While the resolver
+    /// left those bytes `Unmapped` they had no `column()`, so the loop in
+    /// [`plan`] skipped them and they survived the scrub: the footer no longer
+    /// mentioned `region_code`, and twelve structures spelling out
+    /// `region_code` and its values sat in the served object.
+    #[test]
+    fn an_inline_column_metadata_does_not_survive_the_scrub_of_its_column() {
+        let sample = Sample::load("tests/fixtures/inline-colmeta.parquet");
+        let rewrite = sample.plan(&["region_code"]);
+
+        let inline: Vec<&crate::index::Region> = sample
+            .index
+            .regions()
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, RegionKind::ColumnMetadata { column } if column == "region_code")
+            })
+            .collect();
+        assert_eq!(inline.len(), 4, "one per row group");
+
+        // Each one is inside a scrub span...
+        for region in &inline {
+            assert!(
+                rewrite
+                    .scrub()
+                    .iter()
+                    .any(|s| s.start <= region.start && region.end() <= s.end),
+                "{region:?} is not scrubbed"
+            );
+        }
+
+        // ...and the withheld column's name really was in those bytes, so the
+        // assertion above is about a leak rather than about empty space.
+        let name = b"region_code";
+        let original = &sample.bytes;
+        assert!(
+            inline
+                .iter()
+                .any(|r| original[r.start as usize..r.end() as usize]
+                    .windows(name.len())
+                    .any(|w| w == name)),
+            "the fixture's inline metadata does not name the column"
+        );
+        let served = sample.served(&rewrite);
+        assert!(
+            !served[..rewrite.footer_start() as usize]
+                .windows(name.len())
+                .any(|w| w == name),
+            "the withheld column is still named below the footer"
+        );
+    }
+
     #[test]
     fn the_served_object_indexes_as_parquet_and_holds_zeroes_where_the_columns_were() {
         let sample = Sample::load(NYC);

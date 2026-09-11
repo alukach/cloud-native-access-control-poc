@@ -113,8 +113,28 @@
 //!    every tag `tiff` decoded must appear in the scan with the same field type
 //!    and count, or the file is refused. The one gap is a tag whose TYPE this
 //!    resolver does not know a size for: its value cannot be located, so it
-//!    falls to `Unmapped`. Both committed COGs come out with zero unmapped
-//!    bytes, so nothing real is hitting that path.
+//!    falls to `Unmapped`. No file measured so far reaches that path.
+//!
+//!    **A value's extent is its word-aligned slot, not its length.** TIFF 6.0
+//!    requires every value to begin on a word boundary, so a value of ODD
+//!    length is followed by one filler byte that belongs to no structure at
+//!    all. GDAL writes `GDAL_METADATA` (42112) as ASCII of whatever length the
+//!    metadata happens to be, and in a real Sentinel-2 COG
+//!    (`sentinel-cogs.s3.us-west-2.amazonaws.com`,
+//!    `S2A_10SEG_20240923_0_L2A/TCI.tif`) that value is 81 bytes ending at
+//!    1303: one `Unmapped` byte in the middle of the metadata prefix, which
+//!    denies EVERY read of the header -- the first read any reader makes. That
+//!    is issue #23's COG half, and it is the harm this rule exists to prevent
+//!    arriving one byte at a time.
+//!
+//!    So a gap of exactly one byte at an odd offset immediately after an
+//!    out-of-line value is folded into that value's region. The word-aligned
+//!    slot IS the value's footprint, and a filler byte is not a vocabulary
+//!    word a policy author should have to write a rule about -- which is also
+//!    why it gets no metadata name of its own. One byte and an odd offset are
+//!    the only gap the alignment rule can produce; anything wider is something
+//!    else and stays `Unmapped`. `tests/fixtures/odd-tag.tif` is the same file
+//!    shape in 19 KB.
 //!
 //! 7. **Georeferencing is refused rather than guessed.** `ModelPixelScale`
 //!    (33550) plus `ModelTiepoint` (33922), or `ModelTransformation` (34264),
@@ -561,6 +581,8 @@ pub fn build_index(bytes: &[u8], object_size: u64) -> Result<LayoutIndex, CogErr
         }
     }
 
+    pad_word_aligned_values(&mut regions);
+
     Ok(LayoutIndex::try_new(regions, object_size)?)
 }
 
@@ -578,6 +600,44 @@ fn value_region_name(tag: u16) -> &'static str {
         TILE_BYTE_COUNTS => "tile_byte_counts",
         GEO_KEY_DIRECTORY | GEO_DOUBLE_PARAMS | GEO_ASCII_PARAMS => "geo_keys",
         _ => "tag_values",
+    }
+}
+
+/// Every name [`value_region_name`] can return, which is exactly the set of
+/// regions [`pad_word_aligned_values`] may extend.
+const VALUE_REGION_NAMES: [&str; 4] =
+    ["tile_offsets", "tile_byte_counts", "geo_keys", "tag_values"];
+
+/// Rule 6, the alignment half: fold TIFF's word-alignment pad byte into the
+/// value it follows.
+///
+/// A value of odd length is followed by one filler byte that belongs to no
+/// structure, because the next value has to start on a word boundary. Left
+/// alone it is an `Unmapped` byte inside the metadata prefix, and unmapped
+/// metadata denies the first read a reader makes -- which for a Sentinel-2 COG
+/// it did, at byte 1303. See rule 6 in the module docs.
+///
+/// A gap is bytes no region holds, so extending a region into one can neither
+/// take a byte from another region nor create the overlap
+/// [`LayoutIndex::try_new`] refuses. Nothing else is claimed: not a wider gap,
+/// not a gap at an even offset, and not a gap after a region that is not a tag
+/// value.
+fn pad_word_aligned_values(regions: &mut [Region]) {
+    let mut order: Vec<usize> = (0..regions.len()).collect();
+    order.sort_by_key(|i| regions[*i].start);
+    for pair in order.windows(2) {
+        let (before, after) = (pair[0], pair[1]);
+        let end = regions[before].end();
+        // An even end is already on a word boundary, so whatever follows it is
+        // not alignment padding.
+        if end.is_multiple_of(2) || Some(regions[after].start) != end.checked_add(1) {
+            continue;
+        }
+        let is_value = matches!(&regions[before].kind,
+            RegionKind::Metadata { name } if VALUE_REGION_NAMES.contains(&name.as_str()));
+        if is_value {
+            regions[before].len += 1;
+        }
     }
 }
 
@@ -1570,6 +1630,76 @@ mod tests {
         assert_eq!(ifds.len(), 3);
         // 21 entries: 2 + 21 * 12 + 4.
         assert_eq!((ifds[0].start, ifds[0].end()), (192, 450));
+    }
+
+    // Rule 6, the alignment half. `odd-tag.tif` carries a 185-byte
+    // `GDAL_METADATA` (42112) ending at the odd offset 837, and the next value
+    // -- `ModelPixelScale` -- starts at 838. The byte between them is TIFF's
+    // word-alignment padding and belongs to no structure.
+    //
+    // This is not a synthetic shape. Every COG on
+    // `sentinel-cogs.s3.us-west-2.amazonaws.com` is written the same way;
+    // `S2A_10SEG_20240923_0_L2A/TCI.tif` has an 81-byte `GDAL_METADATA` ending
+    // at 1303 and used to index with exactly one unmapped byte, sitting in the
+    // middle of the metadata prefix. One unmapped byte there is not a rounding
+    // error: it denies the header read that every reader makes first.
+    #[test]
+    fn the_word_alignment_pad_after_an_odd_length_tag_value_is_not_unmapped() {
+        let bytes = read("tests/fixtures/odd-tag.tif");
+        let idx = index(&bytes);
+        assert_eq!(unmapped_bytes(&idx), 0);
+
+        // Folded into the value it follows rather than given a name of its own.
+        let at = idx.resolve(&(837..838));
+        assert_eq!(at.len(), 1, "{at:?}");
+        assert_eq!((at[0].start, at[0].end()), (652, 838), "{at:?}");
+        assert_eq!(
+            at[0].kind,
+            RegionKind::Metadata {
+                name: "tag_values".into()
+            }
+        );
+
+        // The property that matters: a reader fetching the metadata prefix in
+        // one range is no longer denied by a single byte inside it.
+        let policy = Policy::load(
+            "allow:\n  - \"region.kind = 'metadata'\"",
+            crate::policy::QUERYABLES,
+        )
+        .unwrap();
+        let user = json!({});
+        assert!(idx
+            .try_resolve(&(0..1828))
+            .unwrap()
+            .iter()
+            .all(|r| policy.permits(&json!({"user": &user, "region": r.props()}))));
+    }
+
+    // Only the alignment pad, and only when it IS one. Shortening the ASCII
+    // value by a byte makes it end EVEN, so the two bytes before the next value
+    // are not padding and must stay `Unmapped` -- a resolver that simply
+    // absorbed any following gap would swallow them.
+    #[test]
+    fn a_gap_that_is_not_a_single_word_alignment_pad_stays_unmapped() {
+        let mut bytes = read("tests/fixtures/odd-tag.tif");
+        // Find tag 42112's entry in IFD 0 and shorten its count by one.
+        let ifd = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let n = u16::from_le_bytes(bytes[ifd..ifd + 2].try_into().unwrap()) as usize;
+        let entry = (0..n)
+            .map(|i| ifd + 2 + i * 12)
+            .find(|at| u16::from_le_bytes(bytes[*at..*at + 2].try_into().unwrap()) == 42112)
+            .expect("odd-tag.tif has a GDAL_METADATA tag");
+        let count = u32::from_le_bytes(bytes[entry + 4..entry + 8].try_into().unwrap());
+        assert_eq!(count, 185);
+        bytes[entry + 4..entry + 8].copy_from_slice(&(count - 1).to_le_bytes());
+
+        let idx = index(&bytes);
+        assert_eq!(unmapped_bytes(&idx), 2, "{:?}", idx.resolve(&(830..840)));
+        let at = idx.resolve(&(836..838));
+        assert!(
+            at.iter().all(|r| matches!(r.kind, RegionKind::Unmapped)),
+            "{at:?}"
+        );
     }
 
     // `Metadata` must never be a fallback classification: a blanket

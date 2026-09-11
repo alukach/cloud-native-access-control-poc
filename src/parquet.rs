@@ -28,10 +28,12 @@
 //!
 //! # The format rules, each from a specification review
 //!
-//! 1. **`ColumnChunk.file_offset` is never read.** `parquet.thrift` deprecates
-//!    it and records that implementations disagreed about whether it points at
-//!    the `ColumnMetaData` or at the first page, and that "in many cases the
-//!    `ColumnMetaData` at this location is wrong".
+//! 1. **`ColumnChunk.file_offset` never gives a chunk its extent.**
+//!    `parquet.thrift` deprecates it and records that implementations
+//!    disagreed about whether it points at the `ColumnMetaData` or at the first
+//!    page, and that "in many cases the `ColumnMetaData` at this location is
+//!    wrong". It is read for one purpose only, under rule 10, and only where
+//!    the rest of the layout corroborates what it says.
 //! 2. **A chunk runs from `min(dictionary_page_offset, data_page_offset)` for
 //!    `total_compressed_size` bytes.** Starting at the data page leaves the
 //!    dictionary page outside every region, and for a low-cardinality column
@@ -71,6 +73,41 @@
 //! 9. **An encrypted footer (`PARE`) is refused.** Out of scope, and out of
 //!    scope has to mean an error rather than a partial classification; tracked
 //!    as issue #7.
+//! 10. **A chunk's inline `ColumnMetaData` is claimed for that column.** This
+//!     is issue #23, and it is the one structure between the pages that no
+//!     length in the footer describes.
+//!
+//!     parquet-cpp -- pyarrow, and anything else built on it -- wrote a **copy
+//!     of each chunk's `ColumnMetaData` thrift into the data stream**,
+//!     immediately after that chunk's last page, until Arrow 12 stopped. That
+//!     is what `file_offset` points at in such a file. `tests/fixtures/`
+//!     `inline-colmeta.parquet` carries one after every chunk and the
+//!     Hugging Face copy of `adult-census-income` -- 15 columns x 33 row
+//!     groups, written by parquet-cpp-arrow 11.0.0 -- carries 495 of them,
+//!     45,498 bytes that this resolver used to leave entirely `Unmapped`.
+//!     Unmapped denies, so every coalesced read straddling one was refused;
+//!     worse, [`crate::rewrite`] scrubs by column, so a structure spelling out
+//!     a withheld column's name and its chunk-level min and max **survived the
+//!     scrub in plaintext**.
+//!
+//!     Nothing records its length, and a `ColumnMetaData` parse at
+//!     `file_offset` is the second read this resolver does not make. So the
+//!     extent comes from the layout instead: after every other region is
+//!     placed, a gap whose FIRST BYTE is exactly some chunk's `file_offset` is
+//!     that chunk's inline metadata, and it runs to whatever comes next.
+//!     `file_offset` is believed only when it equals that chunk's own end
+//!     (`start + total_compressed_size`), which is the layout corroborating the
+//!     deprecated field rather than this resolver trusting it; a writer that
+//!     sets it to the first page (the other reading rule 1 names) or to 0 (what
+//!     every modern writer does) offers no such corroboration and claims
+//!     nothing. Two chunks naming one offset cannot both own it and neither
+//!     does.
+//!
+//!     The bytes move from "nobody may read" to "whoever may read this column
+//!     may read", which is a real widening and the correct one: they are a
+//!     serialization of that column's metadata and of nothing else. Rule 8
+//!     forbids the alternative -- a blanket `region.kind = 'metadata'` allow
+//!     must not reach a structure carrying a column's min and max.
 
 use crate::index::{IndexError, LayoutIndex, Region, RegionKind};
 
@@ -231,11 +268,17 @@ pub fn build_index(footer: &[u8], object_size: u64) -> Result<LayoutIndex, Parqu
             kind: named("footer_trailer"),
         },
     ];
+    // Rule 10. `(file_offset, column)` for every chunk whose `file_offset` the
+    // layout corroborates. Resolved into regions only after every other region
+    // is placed, because the extent of an inline `ColumnMetaData` is knowable
+    // only from where the next structure starts.
+    let mut inline = Vec::new();
     for (row_group, group) in metadata.row_groups().iter().enumerate() {
         for column in group.columns() {
-            push_column_regions(column, row_group, &mut regions)?;
+            push_column_regions(column, row_group, &mut regions, &mut inline)?;
         }
     }
+    push_inline_column_metadata(&mut regions, inline, object_size);
 
     Ok(LayoutIndex::try_new(regions, object_size)?)
 }
@@ -250,6 +293,7 @@ fn push_column_regions(
     column: &ColumnChunkMetaData,
     row_group: usize,
     out: &mut Vec<Region>,
+    inline: &mut Vec<(u64, String)>,
 ) -> Result<(), ParquetError> {
     // Rule 4: the full dotted path. `path_in_schema` is a `list<string>` in the
     // thrift and `ColumnPath::string` joins it with dots, which is the spelling
@@ -291,14 +335,27 @@ fn push_column_regions(
         Some(dictionary) if dictionary <= data_page => dictionary,
         _ => data_page,
     };
+    let start = checked(start, "data_page_offset")?;
     out.push(Region {
-        start: checked(start, "data_page_offset")?,
+        start,
         len,
         kind: RegionKind::ColumnChunk {
             column: name.clone(),
             row_group,
         },
     });
+
+    // Rule 10, the corroboration half: `file_offset` is a candidate only when
+    // it names the first byte after this chunk's own pages. Anywhere else it is
+    // one of the readings rule 1 refuses to choose between, and a candidate
+    // that does not turn out to begin a gap is dropped in
+    // `push_inline_column_metadata` anyway. `checked_add` and not `+`: both
+    // operands come from the footer, and an overflowing chunk is `try_new`'s
+    // error to report rather than this function's panic.
+    let file_offset = column.file_offset();
+    if file_offset > 0 && start.checked_add(len) == Some(file_offset as u64) {
+        inline.push((file_offset as u64, name.clone()));
+    }
 
     // Rule 5. Both structures are per-page disclosures about this column, so
     // both are attributed to it. An offset without its length is not emitted at
@@ -340,6 +397,69 @@ fn push_column_regions(
     }
 
     Ok(())
+}
+
+/// Rule 10, the extent half: turn every unclaimed gap that a chunk's
+/// `file_offset` names into that column's inline `ColumnMetaData` region.
+///
+/// Runs over the finished region list because a gap is defined by what is
+/// around it. Only gaps are claimed, so this can never take a byte from another
+/// region, and it can never create the overlap [`LayoutIndex::try_new`] would
+/// refuse -- whatever it does not claim stays `Unmapped`, which is where these
+/// bytes were before.
+fn push_inline_column_metadata(
+    regions: &mut Vec<Region>,
+    mut candidates: Vec<(u64, String)>,
+    object_size: u64,
+) {
+    if candidates.is_empty() {
+        return;
+    }
+    // Two chunks naming the same offset cannot both own it, and nothing here
+    // can say which does: drop the whole run rather than pick one. Sorted so
+    // that the runs are adjacent and the lookup below can be a binary search.
+    candidates.sort_by_key(|(offset, _)| *offset);
+    let mut unambiguous: Vec<(u64, String)> = Vec::with_capacity(candidates.len());
+    let mut i = 0;
+    while i < candidates.len() {
+        let mut j = i + 1;
+        while j < candidates.len() && candidates[j].0 == candidates[i].0 {
+            j += 1;
+        }
+        if j == i + 1 {
+            unambiguous.push(candidates[i].clone());
+        }
+        i = j;
+    }
+
+    // The gaps, from a sweep over the extents already placed. `max` and not an
+    // assignment: a region set that overlaps is `try_new`'s error to report,
+    // and until it does, this sweep must not run its cursor backwards.
+    let mut extents: Vec<(u64, u64)> = regions.iter().map(|r| (r.start, r.end())).collect();
+    extents.sort_by_key(|(start, _)| *start);
+    let mut gaps: Vec<(u64, u64)> = Vec::new();
+    let mut cursor = 0u64;
+    for (start, end) in extents {
+        if start > cursor {
+            gaps.push((cursor, start));
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < object_size {
+        gaps.push((cursor, object_size));
+    }
+
+    for (start, end) in gaps {
+        if let Ok(at) = unambiguous.binary_search_by_key(&start, |(offset, _)| *offset) {
+            regions.push(Region {
+                start,
+                len: end - start,
+                kind: RegionKind::ColumnMetadata {
+                    column: unambiguous[at].1.clone(),
+                },
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -681,6 +801,148 @@ mod tests {
         assert_eq!(got, expected);
     }
 
+    // The same property against a file a DIFFERENT writer produced, and one
+    // that carries a page index because the writer chose to rather than because
+    // a test asked in-process. `with_page_index` above is arrow-rs writing for
+    // arrow-rs; this is parquet-cpp, and it lays the two structures out
+    // differently -- every `ColumnIndex` first, then every `OffsetIndex`, both
+    // after the last row group.
+    #[test]
+    fn a_real_page_index_written_by_another_implementation_is_classified() {
+        let buf = read("tests/fixtures/page-index.parquet");
+        let idx = index(&buf);
+        let (_, body) = split_footer(&buf);
+        let metadata = ParquetMetaDataReader::decode_metadata(body).unwrap();
+        let mut expected: Vec<(u64, u64, String)> = Vec::new();
+        for group in metadata.row_groups() {
+            for column in group.columns() {
+                let name = column.column_path().string();
+                for (offset, length) in [
+                    (column.column_index_offset(), column.column_index_length()),
+                    (column.offset_index_offset(), column.offset_index_length()),
+                ] {
+                    let (offset, length) = (offset.unwrap(), length.unwrap());
+                    expected.push((offset as u64, offset as u64 + length as u64, name.clone()));
+                }
+            }
+        }
+        // 3 columns x 4 row groups x 2 structures. The fixture is only evidence
+        // while the writer really emitted them.
+        assert_eq!(expected.len(), 24);
+
+        let mut got: Vec<(u64, u64, String)> = idx
+            .regions()
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RegionKind::ColumnIndex { column } => Some((r.start, r.end(), column.clone())),
+                _ => None,
+            })
+            .collect();
+        got.sort();
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
+    // ---- rule 10: the inline ColumnMetaData --------------------------------
+
+    // Issue #23. parquet-cpp wrote a copy of each chunk's `ColumnMetaData`
+    // thrift into the data stream, right after that chunk's pages, until Arrow
+    // 12 stopped -- and `inline-colmeta.parquet` is such a file. Nothing
+    // records its length, so the extent comes from the layout: the gap that
+    // begins at `file_offset` and ends wherever the next structure starts.
+    #[test]
+    fn a_writers_inline_column_metadata_is_claimed_for_its_column() {
+        let buf = read("tests/fixtures/inline-colmeta.parquet");
+        let idx = index(&buf);
+
+        // One per chunk, and each one begins exactly where its chunk ends.
+        let (_, body) = split_footer(&buf);
+        let metadata = ParquetMetaDataReader::decode_metadata(body).unwrap();
+        let mut expected: Vec<(u64, String)> = Vec::new();
+        for group in metadata.row_groups() {
+            for column in group.columns() {
+                // The fixture is only evidence while `file_offset` really
+                // points past the pages rather than at them or at 0.
+                let offset = column.file_offset();
+                assert!(offset > 0, "{}: file_offset is 0", column.file_offset());
+                expected.push((offset as u64, column.column_path().string()));
+            }
+        }
+        assert_eq!(expected.len(), 12, "3 columns x 4 row groups");
+
+        let mut got: Vec<(u64, String)> = idx
+            .regions()
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RegionKind::ColumnMetadata { column } => Some((r.start, column.clone())),
+                _ => None,
+            })
+            .collect();
+        got.sort();
+        expected.sort();
+        assert_eq!(got, expected);
+
+        // The first one, spelled out: `id` in row group 0 runs [4, 2655) and
+        // its inline metadata fills [2655, 2733), where `region_code` begins.
+        let at = idx.resolve(&(2655..2656));
+        assert_eq!(at.len(), 1);
+        assert_eq!((at[0].start, at[0].end()), (2655, 2733));
+        assert_eq!(at[0].props()["kind"], "column_metadata");
+        assert_eq!(at[0].props()["column"], "id");
+
+        // It is the column's, not metadata's: rule 8 forbids a blanket
+        // `region.kind = 'metadata'` allow from reaching a structure that
+        // spells out a column's name and its chunk-level min and max.
+        let blanket = Policy::load(
+            "allow:\n  - \"region.kind = 'metadata'\"",
+            crate::policy::QUERYABLES,
+        )
+        .unwrap();
+        assert!(!blanket.permits(&json!({"user": {}, "region": at[0].props()})));
+        // And it answers to a rule about that column.
+        let about_id = Policy::load(
+            "allow:\n  - \"region.column = 'id'\"",
+            crate::policy::QUERYABLES,
+        )
+        .unwrap();
+        assert!(about_id.permits(&json!({"user": {}, "region": at[0].props()})));
+    }
+
+    // Rule 10 believes `file_offset` only where the layout corroborates it.
+    // Shortening the chunk by one byte moves its end off the offset the footer
+    // names, and with nothing left to corroborate, the bytes go back to
+    // `Unmapped` -- which denies -- rather than being attributed on the word of
+    // a field `parquet.thrift` deprecated.
+    #[test]
+    fn an_uncorroborated_file_offset_claims_nothing() {
+        let bytes = doctored("tests/fixtures/inline-colmeta.parquet", |row_groups| {
+            let column = &mut row_groups[0].columns_mut()[0];
+            let shorter = column.compressed_size() - 1;
+            *column = column
+                .clone()
+                .into_builder()
+                .set_total_compressed_size(shorter)
+                .build()
+                .unwrap();
+        });
+        let idx = index(&bytes);
+        // The chunk now ends at 2654 and `file_offset` still says 2655, so the
+        // whole run from 2654 to the next chunk is unclassified.
+        let at = idx.resolve(&(2654..2733));
+        assert!(
+            at.iter().all(|r| matches!(r.kind, RegionKind::Unmapped)),
+            "{at:?}"
+        );
+        // The other eleven chunks are untouched, so this is the corroboration
+        // failing rather than the feature being off.
+        let claimed = idx
+            .regions()
+            .iter()
+            .filter(|r| matches!(r.kind, RegionKind::ColumnMetadata { .. }))
+            .count();
+        assert_eq!(claimed, 11);
+    }
+
     // ---- rule 8: named metadata, never a fallback --------------------------
 
     #[test]
@@ -754,6 +1016,39 @@ mod tests {
             assert!(
                 unmapped * 20 < size,
                 "{file}: {unmapped} of {size} bytes unmapped"
+            );
+        }
+    }
+
+    // The 5% above is slack the loop above needs in order to keep being true
+    // for a fixture nobody has written yet. It is also, measured against a
+    // foreign file, far too much slack to catch anything: the 495 inline
+    // `ColumnMetaData` structures of issue #23 were 8.2% of Hugging Face's
+    // `adult-census-income` but only 2.3% of the same writer's output at this
+    // fixture's size, which passes a 5% bar while leaving one unclassified span
+    // per column chunk.
+    //
+    // So this pins the number itself. Zero is what every committed file
+    // measures, across four writers now -- DuckDB, parquet-cpp 11, parquet-cpp
+    // 25 and GDAL -- and a fixture that cannot reach zero is a resolver gap
+    // that should be argued for in a review rather than absorbed by a
+    // percentage.
+    #[test]
+    fn no_committed_parquet_file_has_any_unmapped_bytes() {
+        for (file, bytes) in every_parquet_file() {
+            let idx = index(&bytes);
+            let unmapped: Vec<_> = idx
+                .regions()
+                .iter()
+                .filter(|r| matches!(r.kind, RegionKind::Unmapped))
+                .map(|r| (r.start, r.end()))
+                .collect();
+            assert!(
+                unmapped.is_empty(),
+                "{file}: {} unmapped spans, {} bytes: {:?}",
+                unmapped.len(),
+                unmapped.iter().map(|(s, e)| e - s).sum::<u64>(),
+                &unmapped[..unmapped.len().min(4)]
             );
         }
     }

@@ -213,7 +213,7 @@ and `rustup` installs it automatically). For the browser demo you also need
 ### The crate
 
 ```sh
-cargo test          # 183 tests; the test names are the specification
+cargo test          # 190 tests; the test names are the specification
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -232,6 +232,9 @@ Worth reading by name, since each pins a bug that would otherwise have shipped:
 | `a_typo_is_rejected_inside_every_container_variant` | CQL2 property typos that fail open |
 | `end_at_u64_max_clamps_instead_of_overflowing` | wraps to `0..0` in release, panics in debug |
 | `the_codec_reproduces_every_fixture_footer_byte_for_byte` | the round-trip identity every footer rewrite rests on |
+| `no_committed_parquet_file_has_any_unmapped_bytes` | the coverage invariant, pinned at zero instead of at 5% |
+| `an_inline_column_metadata_does_not_survive_the_scrub_of_its_column` | parquet-cpp repeats a column's min/max below the footer |
+| `the_word_alignment_pad_after_an_odd_length_tag_value_is_not_unmapped` | one byte that denied every Sentinel-2 COG header read |
 | `withholding_a_groups_only_leaf_prunes_the_group_rather_than_emptying_it` | `num_children=0` silently reshapes the schema |
 
 ### The gateway
@@ -338,7 +341,9 @@ reads. A link with no parameters is the page at its defaults.
 
 ### Regenerating the sample data
 
-Only needed if you change the fixtures. Requires `duckdb` and `gdal`:
+Only needed if you change the fixtures. Requires `duckdb` and `gdal`, plus two
+pinned `pyarrow` interpreters for the two fixtures DuckDB cannot produce (see
+`tests/fixtures/README.md`; both steps skip with a warning when unset):
 
 ```sh
 ./scripts/make-fixtures.sh all      # or: demo | fixtures | verify

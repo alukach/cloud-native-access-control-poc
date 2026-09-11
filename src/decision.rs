@@ -360,6 +360,14 @@ impl Verdict {
 ///   located by an offset in the footer or the IFD. A reader that did not
 ///   project the column, or did not request the tile, never parses them -- and
 ///   a reader that did is being denied on purpose. Blank.
+/// * [`RegionKind::ColumnMetadata`] -- parquet-cpp's inline copy of a chunk's
+///   `ColumnMetaData` -- is on the blankable side of the same line, and the
+///   only variant where the call is close enough to argue. It is *found by* the
+///   footer (through `ColumnChunk.file_offset`) and nothing is found *through*
+///   it: every offset it holds is a duplicate of one the footer already
+///   carries, which is why `parquet.thrift` deprecated the field and why no
+///   modern reader follows it. A reader that does follow it sees a corrupt
+///   struct rather than a wrong answer, and that is the direction to fail in.
 ///
 /// Exhaustive, with no catch-all: a new [`RegionKind`] must fail to compile
 /// here rather than inherit a default. Defaulting to blankable would serve
@@ -370,6 +378,7 @@ fn is_blankable(kind: &RegionKind) -> bool {
     match kind {
         RegionKind::Metadata { .. } | RegionKind::Unmapped => false,
         RegionKind::ColumnChunk { .. }
+        | RegionKind::ColumnMetadata { .. }
         | RegionKind::ColumnIndex { .. }
         | RegionKind::BloomFilter { .. }
         | RegionKind::Tile { .. } => true,
