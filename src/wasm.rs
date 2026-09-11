@@ -28,7 +28,16 @@
 //! same principal validation and the same conjunction. This module resolves
 //! regions for *display* only. A binding that re-derived the rule would be a
 //! second implementation of it, and the second implementation is the one
-//! nobody audits.
+//! nobody audits. The same goes for the zero-fill spans and the arithmetic
+//! that applies them: both come from `decision.rs` unchanged.
+//!
+//! # The denial mode is a parameter, and its default is the strict one
+//!
+//! [`DenialMode`] crosses as an optional string, `"refuse"` or `"zero_fill"`,
+//! and an absent argument means `"refuse"` -- so a caller written before the
+//! mode existed keeps the behaviour it was written against. See
+//! [`DenialMode::ZeroFill`] for the readers it is unsafe for; the choice is
+//! the caller's to make knowingly, which is why nothing here infers it.
 //!
 //! # Offsets cross the boundary as `f64`
 //!
@@ -42,7 +51,7 @@
 
 use crate::{
     cog,
-    decision::{self, Decision, DenyReason},
+    decision::{self, Decision, DenialMode, DenyReason, RedactError, Verdict},
     index::LayoutIndex,
     parquet,
     policy::{Policy, QUERYABLES},
@@ -131,6 +140,23 @@ impl Reason {
     }
 }
 
+/// The JS-facing spelling of [`DenialMode`]. Absent means
+/// [`DenialMode::Refuse`]; that is the fail-closed default and the behaviour
+/// every caller written before the second mode existed already expects.
+///
+/// A closed set, like [`Format::parse`], and for a sharper reason: a typo that
+/// fell back to `Refuse` would only cost a denial, but a typo that fell back
+/// to `ZeroFill` would serve a partially blanked body to a client that asked
+/// for a strict refusal. Neither is acceptable as a *silent* answer, so an
+/// unrecognized spelling is refused outright and the caller finds out.
+pub fn denial_mode(name: Option<&str>) -> Option<DenialMode> {
+    match name {
+        None | Some("refuse") => Some(DenialMode::Refuse),
+        Some("zero_fill") => Some(DenialMode::ZeroFill),
+        Some(_) => None,
+    }
+}
+
 /// One check, with the extra detail the demo renders.
 ///
 /// # `regions` is a demo-only affordance
@@ -157,6 +183,13 @@ pub struct Outcome {
     /// [`Decision::Authorized`], the extent it must fetch instead of echoing
     /// the range it asked for. `None` on any denial.
     pub canonical: Option<std::ops::Range<u64>>,
+    /// The extents of `canonical` that must be overwritten with zeroes before
+    /// any byte is returned, as **absolute file offsets** -- see
+    /// [`Verdict::Serve`], whose `blank` field this is. Always empty under
+    /// [`DenialMode::Refuse`], so a non-empty `blank` is exactly the signal
+    /// "this was served only because the caller asked for zero-fill".
+    /// [`Outcome::redact`] applies it; nothing else should do the arithmetic.
+    pub blank: Vec<std::ops::Range<u64>>,
     /// Indices into [`LayoutIndex::regions`] of every region the *requested*
     /// range overlapped, in order. Empty when the range never parsed.
     pub regions: Vec<u32>,
@@ -171,15 +204,37 @@ impl Outcome {
     ///
     /// The demo's headline number. True when the requested range overlapped
     /// more than one region and the policy answers differently for at least
-    /// two of them -- one permitted, one not. That is the case a conjunctive
-    /// decision turns into a denial of the whole request, and the case a
-    /// reader that coalesces nearby reads produces by accident.
+    /// two of them -- one permitted, one not. That is the case a reader which
+    /// coalesces nearby reads produces by accident: under
+    /// [`DenialMode::Refuse`] a conjunctive decision turns it into a denial of
+    /// the whole request, and under [`DenialMode::ZeroFill`] it is the case
+    /// that gets served with `blank` non-empty. A straddle is the *same* set
+    /// of requests either way; only what happens to it differs.
     ///
     /// `permitted > 0 && denied > 0` already implies more than one region;
     /// the length check is spelled out anyway because the definition is
     /// stated in terms of it.
     pub fn straddles(&self) -> bool {
         self.regions.len() > 1 && self.permitted > 0 && self.denied > 0
+    }
+
+    /// Blank the protected extents in a buffer holding exactly `canonical`.
+    ///
+    /// A thin forward to [`Verdict::redact`] so that the absolute-to-buffer
+    /// offset subtraction exists in exactly one place in the crate. On any
+    /// failure -- a denial, or a buffer that is not the canonical extent --
+    /// the buffer is zeroed, so a caller that ignores the `Result` serves
+    /// zeroes rather than the object.
+    pub fn redact(&self, buffer: &mut [u8]) -> Result<(), RedactError> {
+        let Some(canonical) = self.canonical.clone() else {
+            buffer.fill(0);
+            return Err(RedactError::NotServed);
+        };
+        Verdict::Serve {
+            canonical,
+            blank: self.blank.clone(),
+        }
+        .redact(buffer)
     }
 }
 
@@ -319,16 +374,34 @@ pub fn check_header(
     user: &Value,
     header: Option<&str>,
 ) -> Outcome {
+    check_header_with_mode(index, policy, user, header, DenialMode::Refuse)
+}
+
+/// [`check_header`], with the caller choosing what happens to forbidden bytes.
+///
+/// See [`DenialMode::ZeroFill`] before selecting it: a client that parses the
+/// blanked bytes gets corrupt data rather than a clean refusal, and only the
+/// caller knows which client it is serving.
+pub fn check_header_with_mode(
+    index: &LayoutIndex,
+    policy: &Policy,
+    user: &Value,
+    header: Option<&str>,
+    mode: DenialMode,
+) -> Outcome {
     // The verdict, and only the verdict, comes from here.
-    let (allowed, reason, canonical) = match decision::check(index, policy, user, header) {
-        Decision::Authorized { canonical } => (true, Reason::Authorized, Some(canonical)),
-        Decision::Denied {
-            reason: DenyReason::BadRange,
-        } => (false, Reason::BadRange, None),
-        Decision::Denied {
-            reason: DenyReason::NotPermitted,
-        } => (false, Reason::NotPermitted, None),
-    };
+    let (allowed, reason, canonical, blank) =
+        match decision::check_with_mode(index, policy, user, header, mode) {
+            Verdict::Serve { canonical, blank } => {
+                (true, Reason::Authorized, Some(canonical), blank)
+            }
+            Verdict::Denied {
+                reason: DenyReason::BadRange,
+            } => (false, Reason::BadRange, None, Vec::new()),
+            Verdict::Denied {
+                reason: DenyReason::NotPermitted,
+            } => (false, Reason::NotPermitted, None, Vec::new()),
+        };
 
     // Detail for the UI. Re-parsing the header is not a second decision: it is
     // the same pure function on the same input, and its result is used only to
@@ -350,14 +423,20 @@ pub fn check_header(
             regions.push(i);
         }
 
-        if allowed {
+        if allowed && blank.is_empty() {
             // Derived, not re-evaluated, and the derivation is the decision
-            // rule itself: `Authorized` is a conjunction over *exactly* these
-            // regions, so every one of them is permitted. Re-running the
-            // policy here could only ever disagree with the answer already
-            // given -- and it would cost a second evaluation per region on the
-            // path that runs when the system is working, which is the path the
-            // demo times.
+            // rule itself: a serve with nothing blanked is a conjunction over
+            // *exactly* these regions, so every one of them is permitted.
+            // Re-running the policy here could only ever disagree with the
+            // answer already given -- and it would cost a second evaluation per
+            // region on the path that runs when the system is working, which is
+            // the path the demo times.
+            //
+            // The `blank.is_empty()` guard is what keeps that derivation sound
+            // under `ZeroFill`, where `allowed` no longer implies every region
+            // was permitted: a zero-filled serve is precisely a serve over
+            // regions the policy refused, and counting them as permitted would
+            // colour the demo's grid green over the bytes it blanked.
             permitted = u32::try_from(regions.len()).unwrap_or(u32::MAX);
         } else {
             // The explanation is only assembled on a denial, which is the case
@@ -378,6 +457,7 @@ pub fn check_header(
         allowed,
         reason,
         canonical,
+        blank,
         regions,
         permitted,
         denied,
@@ -401,6 +481,19 @@ pub fn check_offsets(
     start: u64,
     end: u64,
 ) -> Outcome {
+    check_offsets_with_mode(index, policy, user, start, end, DenialMode::Refuse)
+}
+
+/// [`check_offsets`], with the caller choosing what happens to forbidden
+/// bytes. See [`DenialMode::ZeroFill`] before selecting it.
+pub fn check_offsets_with_mode(
+    index: &LayoutIndex,
+    policy: &Policy,
+    user: &Value,
+    start: u64,
+    end: u64,
+    mode: DenialMode,
+) -> Outcome {
     if end <= start {
         // An empty or inverted extent. `decision::check` reaches the same
         // verdict for an empty range (`try_resolve` refuses it), and it is a
@@ -412,6 +505,7 @@ pub fn check_offsets(
             allowed: false,
             reason: Reason::NotPermitted,
             canonical: None,
+            blank: Vec::new(),
             regions: Vec::new(),
             permitted: 0,
             denied: 0,
@@ -420,7 +514,7 @@ pub fn check_offsets(
     // Inclusive on the wire: `end - 1`, and `end > start >= 0` so it cannot
     // underflow.
     let header = format!("bytes={}-{}", start, end - 1);
-    check_header(index, policy, user, Some(&header))
+    check_header_with_mode(index, policy, user, Some(&header), mode)
 }
 
 /// Parse a principal from JSON text.
@@ -520,33 +614,50 @@ impl WasmIndex {
     }
 
     /// Check a half-open byte range, the shape hyparquet and geotiff hand over.
+    ///
+    /// `mode` is `"refuse"` or `"zero_fill"`; `undefined` means `"refuse"`,
+    /// which is both the fail-closed default and what a caller written before
+    /// the second mode existed already expects. An unrecognized spelling
+    /// throws rather than falling back -- see [`denial_mode`].
     pub fn check(
         &self,
         policy: &WasmPolicy,
         user: &str,
         start: f64,
         end: f64,
+        mode: Option<String>,
     ) -> Result<WasmOutcome, JsValue> {
         let user = parse_user(user).map_err(|e| js_error(&e))?;
         let start = offset_from_f64(start).map_err(|e| js_error(&e))?;
         let end = offset_from_f64(end).map_err(|e| js_error(&e))?;
+        let mode = denial_mode(mode.as_deref())
+            .ok_or_else(|| js_error("unknown denial mode (want \"refuse\" or \"zero_fill\")"))?;
         Ok(WasmOutcome {
-            inner: check_offsets(&self.inner, &policy.inner, &user, start, end),
+            inner: check_offsets_with_mode(&self.inner, &policy.inner, &user, start, end, mode),
         })
     }
 
     /// Check a `Range` header. `undefined` means no header, which is a request
-    /// for the whole object.
+    /// for the whole object. `mode` is as on [`WasmIndex::check`].
     #[wasm_bindgen(js_name = checkHeader)]
     pub fn check_header(
         &self,
         policy: &WasmPolicy,
         user: &str,
         header: Option<String>,
+        mode: Option<String>,
     ) -> Result<WasmOutcome, JsValue> {
         let user = parse_user(user).map_err(|e| js_error(&e))?;
+        let mode = denial_mode(mode.as_deref())
+            .ok_or_else(|| js_error("unknown denial mode (want \"refuse\" or \"zero_fill\")"))?;
         Ok(WasmOutcome {
-            inner: check_header(&self.inner, &policy.inner, &user, header.as_deref()),
+            inner: check_header_with_mode(
+                &self.inner,
+                &policy.inner,
+                &user,
+                header.as_deref(),
+                mode,
+            ),
         })
     }
 }
@@ -607,6 +718,46 @@ impl WasmOutcome {
     pub fn straddles(&self) -> bool {
         self.inner.straddles()
     }
+
+    /// Was this served only because zero-fill was asked for? Equivalently:
+    /// does the body have to be redacted before it is returned?
+    #[wasm_bindgen(getter, js_name = zeroFilled)]
+    pub fn zero_filled(&self) -> bool {
+        !self.inner.blank.is_empty()
+    }
+
+    /// The start of each extent that must be blanked, as an **absolute file
+    /// offset** -- the same coordinate system as `start` and `end`, not an
+    /// offset into the fetched buffer. Prefer [`WasmOutcome::redact`], which
+    /// does the conversion in Rust; these are for rendering.
+    #[wasm_bindgen(getter, js_name = blankStarts)]
+    pub fn blank_starts(&self) -> Vec<f64> {
+        self.inner.blank.iter().map(|r| r.start as f64).collect()
+    }
+
+    /// The exclusive end of each extent that must be blanked, absolute. Same
+    /// length and order as `blankStarts`.
+    #[wasm_bindgen(getter, js_name = blankEnds)]
+    pub fn blank_ends(&self) -> Vec<f64> {
+        self.inner.blank.iter().map(|r| r.end as f64).collect()
+    }
+
+    /// Blank the protected extents of a fetched body, in place.
+    ///
+    /// `bytes` must be exactly the authorized extent -- `start..end` -- and is
+    /// rejected otherwise, because blank offsets computed against a body of
+    /// the wrong length land on the wrong bytes. The buffer is zeroed on any
+    /// rejection, so a caller that swallows the exception still cannot serve
+    /// what it fetched.
+    ///
+    /// The whole of the offset arithmetic lives in
+    /// [`Verdict::redact`](crate::decision::Verdict::redact); this is a
+    /// conversion and nothing else.
+    pub fn redact(&self, bytes: &mut [u8]) -> Result<(), JsValue> {
+        self.inner
+            .redact(bytes)
+            .map_err(|e| js_error(&e.to_string()))
+    }
 }
 
 /// Every refusal crosses as a real JS `Error`.
@@ -652,7 +803,10 @@ pub fn queryables() -> String {
     queryables_json()
 }
 
+// See `decision.rs`: a one-element list of byte extents is what this crate
+// works in, not a `vec![0..10]` that meant `(0..10).collect()`.
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
     use crate::index::{Region, RegionKind};
@@ -1142,6 +1296,129 @@ mod tests {
         assert!(parse_user("null").is_ok());
         assert!(parse_user("{role: analyst}").is_err());
         assert!(parse_user("").is_err());
+    }
+
+    // ---- The second denial mode --------------------------------------------
+
+    // The binding is still `decision::check_with_mode` and nothing else, for
+    // the mode it was given -- including the blank spans, which are the half a
+    // caller could get wrong on its own.
+    #[test]
+    fn the_binding_answers_exactly_what_the_mode_aware_check_answers() {
+        let (idx, pol) = (index(), policy());
+        let users = [
+            analyst(),
+            json!({"role": "auditor"}),
+            json!({}),
+            json!(null),
+        ];
+        for mode in [DenialMode::Refuse, DenialMode::ZeroFill] {
+            for user in &users {
+                for header in HEADERS {
+                    let direct = decision::check_with_mode(&idx, &pol, user, *header, mode);
+                    let bound = check_header_with_mode(&idx, &pol, user, *header, mode);
+                    match direct {
+                        Verdict::Serve { canonical, blank } => {
+                            assert!(bound.allowed, "{mode:?} / {header:?} / {user}");
+                            assert_eq!(bound.reason, Reason::Authorized);
+                            assert_eq!(bound.canonical, Some(canonical), "{header:?} / {user}");
+                            assert_eq!(bound.blank, blank, "{mode:?} / {header:?} / {user}");
+                        }
+                        Verdict::Denied { reason } => {
+                            assert!(!bound.allowed, "{mode:?} / {header:?} / {user}");
+                            assert_eq!(bound.canonical, None);
+                            assert!(bound.blank.is_empty(), "{mode:?} / {header:?} / {user}");
+                            let expected = match reason {
+                                DenyReason::BadRange => Reason::BadRange,
+                                DenyReason::NotPermitted => Reason::NotPermitted,
+                            };
+                            assert_eq!(bound.reason, expected, "{header:?} / {user}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // The default has to be the strict mode, or every caller written before
+    // zero-fill existed silently starts serving partially blanked bodies.
+    #[test]
+    fn the_default_mode_is_refuse_on_both_entry_points() {
+        let (idx, pol) = (index(), policy());
+        for header in HEADERS {
+            assert_eq!(
+                check_header(&idx, &pol, &analyst(), *header),
+                check_header_with_mode(&idx, &pol, &analyst(), *header, DenialMode::Refuse),
+                "{header:?}"
+            );
+        }
+        assert_eq!(
+            check_offsets(&idx, &pol, &analyst(), 20, 30),
+            check_offsets_with_mode(&idx, &pol, &analyst(), 20, 30, DenialMode::Refuse)
+        );
+        // And the strict mode is what an absent JS argument selects.
+        assert_eq!(denial_mode(None), Some(DenialMode::Refuse));
+        assert_eq!(denial_mode(Some("refuse")), Some(DenialMode::Refuse));
+        assert_eq!(denial_mode(Some("zero_fill")), Some(DenialMode::ZeroFill));
+        // Unrecognized spellings are refused rather than defaulted, in EITHER
+        // direction: a typo that quietly became `zero_fill` would serve a
+        // blanked body to a caller that asked for a strict refusal.
+        for unknown in [
+            "",
+            "ZERO_FILL",
+            "zerofill",
+            "zero-fill",
+            "fill",
+            "Refuse",
+            "true",
+        ] {
+            assert_eq!(denial_mode(Some(unknown)), None, "{unknown}");
+        }
+    }
+
+    // The demo's grid must not be coloured green over bytes that were blanked.
+    // `allowed` alone no longer decides that under zero-fill, so the counts
+    // stop being derivable from it -- this is the test that pins the guard.
+    #[test]
+    fn a_zero_filled_serve_counts_its_regions_as_denied() {
+        let (idx, pol) = (index(), policy());
+        // metadata + public + salary: permitted, permitted, blanked.
+        let out = check_offsets_with_mode(&idx, &pol, &analyst(), 0, 30, DenialMode::ZeroFill);
+        assert!(out.allowed);
+        assert_eq!(out.canonical, Some(0..30));
+        assert_eq!(out.blank, vec![20..30]);
+        assert_eq!(out.regions, vec![0, 1, 2]);
+        assert_eq!((out.permitted, out.denied), (2, 1));
+        // A straddle is the same set of requests in both modes; only what
+        // happens to it differs.
+        assert!(out.straddles());
+        assert!(check_header(&idx, &pol, &analyst(), Some("bytes=0-29")).straddles());
+    }
+
+    // The buffer the demo hands back to hyparquet or geotiff has to be blanked
+    // with the same arithmetic the decision function used, which is why the
+    // binding forwards to `Verdict::redact` rather than exporting offsets and
+    // hoping JS subtracts correctly.
+    #[test]
+    fn the_binding_redacts_a_fetched_body_in_place() {
+        let (idx, pol) = (index(), policy());
+        let out = check_offsets_with_mode(&idx, &pol, &analyst(), 0, 30, DenialMode::ZeroFill);
+        let mut body: Vec<u8> = (0u64..30).map(|b| (b + 1) as u8).collect();
+        out.redact(&mut body).unwrap();
+        for (offset, byte) in body.iter().enumerate() {
+            assert_eq!(*byte == 0, (20..30).contains(&offset), "byte {offset}");
+        }
+        // A body of the wrong length is the response obligation 2 exists to
+        // catch, and a denial has no extent to redact against at all. Both
+        // leave nothing readable behind.
+        let mut wrong = vec![0xffu8; 29];
+        assert!(out.redact(&mut wrong).is_err());
+        assert!(wrong.iter().all(|b| *b == 0));
+        let refused = check_offsets_with_mode(&idx, &pol, &analyst(), 30, 40, DenialMode::ZeroFill);
+        let mut body = vec![0xffu8; 10];
+        assert!(!refused.allowed, "unmapped bytes refuse in both modes");
+        assert!(refused.redact(&mut body).is_err());
+        assert!(body.iter().all(|b| *b == 0));
     }
 
     #[test]
