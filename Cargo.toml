@@ -22,6 +22,9 @@ tiff = "0.11"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
+# Only for attaching a retry hint to a thrown build error. Already in the tree
+# via wasm-bindgen, so declaring it costs nothing in bundle size.
+js-sys = "0.3"
 # wasm32 has no default entropy source, so getrandom needs a backend chosen
 # explicitly. ahash (reached via both parquet and cql2 -> jsonschema) depends
 # on getrandom without enabling wasm_js, and only a crate that declares a

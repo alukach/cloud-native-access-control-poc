@@ -4,6 +4,7 @@ pub mod index;
 pub mod parquet;
 pub mod policy;
 pub mod range;
+pub mod wasm;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
