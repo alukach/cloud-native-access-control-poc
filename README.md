@@ -6,14 +6,23 @@ A proof of concept for column-level and area-level access control over
 Parquet, COG, Zarr and Icechunk — enforced at an S3 gateway, using
 [CQL2](https://docs.ogc.org/is/21-065r2/21-065r2.html) as the rule language.
 
-> **Status: the crate works and the browser demo runs.**
-> Both resolvers parse real files, policies evaluate, the decision function is
-> covered by 140 tests, and the demo drives hyparquet and geotiff.js against
-> the sample files over real range requests. This repository exists to decide whether
+> **Status: question answered. Read [docs/findings.md](docs/findings.md) first.**
+>
+> Refusing range requests that cover forbidden bytes is **not** interoperable —
+> it works only for clients that read exact chunk extents, and GDAL `/vsicurl`
+> cannot be configured into that shape. Serving a rewritten view instead —
+> `rewrite` for Parquet, `sparsify` for COG, both with the withheld bytes
+> scrubbed — works for every client measured, because its correctness does not
+> depend on how a client batches reads.
+>
+> 208 tests, two runnable gateways (`examples/gate.rs`, `examples/cog_gate.rs`),
+> and a browser demo. Not production software; it exists to decide whether
 > [multistore](https://github.com/developmentseed/multistore) should adopt the
-> approach — it is not production software and enforces nothing today.
-> See the [design](docs/plans/2026-09-10-cloud-native-access-control-design.md)
-> and [implementation plan](docs/plans/2026-09-10-cloud-native-access-control-plan.md).
+> approach. Background:
+> [design](docs/plans/2026-09-10-cloud-native-access-control-design.md),
+> [plan](docs/plans/2026-09-10-cloud-native-access-control-plan.md),
+> and [27 issues](https://github.com/alukach/cloud-native-access-control-poc/issues)
+> carrying the detail.
 
 ## The problem
 
