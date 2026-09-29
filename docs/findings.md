@@ -230,6 +230,17 @@ The corrective is cheap and worth building in from the start: test against
 artefacts produced by tools you did not run, and measure clients you did not
 configure.
 
+A third finding has a different shape, and it is the one to watch for next: **a
+defect refused at one layer and admitted at another.** `src/cog.rs` refuses a
+rotated `ModelTransformation` on the grounds that an axis-aligned envelope
+over-covers and `S_INTERSECTS` would then grant tiles whose pixels are outside
+the allowed area. That reasoning was right. It was also written as a property of
+*rotated rasters*, when it is a property of *the predicate* — and so the same
+fail-open walked in through an ordinary north-up file, where the resolver has
+nothing to refuse. The guard was correct and it was in the wrong place. Worth
+asking of every refusal in the crate: is this a fact about the input, or a fact
+about how the input gets used?
+
 ## 7. Things worth knowing regardless of which mode you pick
 
 - **Permit `bloom_filter` and `column_index` for every column you permit.**
@@ -243,6 +254,16 @@ configure.
   Send the canonical range and verify `Content-Range` on the response.
 - **A CDN can strip ranges entirely.** Found while deploying this repository's
   own demo. Same RFC clause, arriving as an infrastructure problem.
+- **Write a spatial rule as `S_CONTAINS(<area>, region.geom)`, never
+  `S_INTERSECTS(region.geom, <area>)`.** A tile is the unit of service, so an
+  existential predicate grants every tile the area touches — 49 tiles where 25
+  were licensed on the sample scene, four of them on edge contact with zero
+  interior overlap. Snap the area outward to the tile grid as well, so the
+  polygon in the policy states the ground served instead of the predicate
+  widening it silently. The over-grant is inherent to tile-granular service;
+  the point is to put it where a licensor can read it. For GeoParquet this
+  matters more, not less: a row-group bbox is an envelope over scattered
+  features, and one row group of global features has a near-world envelope.
 - **Never recommend DuckDB's `disable_parquet_prefetching`.** It disables the
   exact-chunk planner and falls back to 1 MB buffered reads, taking a clean
   client to 8 of 10 straddling.
@@ -250,7 +271,7 @@ configure.
 ## 8. Reproducing this
 
 ```sh
-cargo test                                    # 208 tests
+cargo test                                    # 209 tests
 cargo run --example gate -- --help            # the rewrite+scrub gateway
 ./scripts/make-fixtures.sh verify             # re-measure the sample files
 ```

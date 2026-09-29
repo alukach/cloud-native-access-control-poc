@@ -2249,6 +2249,99 @@ mod tests {
         );
     }
 
+    // A licensed area that GRANTS ground outside itself.
+    //
+    // `S_INTERSECTS` is a positive existential: a tile qualifies if it meets
+    // the allowed area *anywhere*, and the whole tile is then served. At tile
+    // granularity that is not a rounding error, it is the difference between
+    // 25 tiles and 49. The AOI below is the exact union of tiles x 5-9, y 5-9
+    // -- its edges lie ON tile boundaries -- so the 24 extra tiles
+    // `S_INTERSECTS` grants include four whose contact with the area is a
+    // single shared edge and whose interiors overlap it by zero.
+    //
+    // `S_CONTAINS(<allowed area>, region.geom)` is the monotone-safe spelling:
+    // a tile qualifies only if every one of its pixels is inside the area.
+    // It errs the other way -- an area smaller than one tile grants nothing --
+    // which is the direction an access-control rule should err in.
+    //
+    // This is the same defect `a_rotated_model_transformation_is_refused`
+    // refuses at index time, appearing here at policy time, where the crate
+    // cannot refuse it and can only document which spelling is safe.
+    #[test]
+    fn s_intersects_grants_tiles_outside_the_area_and_s_contains_does_not() {
+        let idx = index(&read("data/s2-tci-512.tif"));
+
+        // The union of tiles x 5-9, y 5-9 at level 0. Tile pitch is 5120 m
+        // from the scene origin (499980, 4200000), northing descending.
+        let aoi = "POLYGON((525580 4148800, 551180 4148800, 551180 4174400, \
+                   525580 4174400, 525580 4148800))";
+
+        let granted = |filter: String| {
+            let mut hit = Vec::new();
+            for region in tiles(&idx) {
+                let RegionKind::Tile {
+                    overview_level: 0,
+                    x,
+                    y,
+                    bbox,
+                    ..
+                } = &region.kind
+                else {
+                    continue;
+                };
+                let props = json!({ "region": region.props() });
+                let expr: cql2::Expr = filter.parse().unwrap();
+                if expr.matches(Some(&props)).unwrap() {
+                    hit.push((*x, *y, *bbox));
+                }
+            }
+            hit.sort_unstable_by_key(|(x, y, _)| (*x, *y));
+            hit
+        };
+
+        let permissive = granted(format!("S_INTERSECTS(region.geom, {aoi})"));
+        let safe = granted(format!("S_CONTAINS({aoi}, region.geom)"));
+
+        // The area was drawn around 25 tiles. One spelling serves those; the
+        // other serves a 7x7 block, 96% more ground than was licensed.
+        assert_eq!(safe.len(), 25, "S_CONTAINS");
+        assert_eq!(permissive.len(), 49, "S_INTERSECTS");
+
+        // Every tile `S_CONTAINS` grants lies wholly inside the area, and
+        // every tile it grants is one `S_INTERSECTS` grants too -- so the
+        // difference is purely the over-grant, not a different selection.
+        let (ax0, ay0, ax1, ay1) = (525580.0, 4148800.0, 551180.0, 4174400.0);
+        for (x, y, bbox) in &safe {
+            let (x0, x1) = (bbox[0].min(bbox[2]), bbox[0].max(bbox[2]));
+            let (y0, y1) = (bbox[1].min(bbox[3]), bbox[1].max(bbox[3]));
+            assert!(
+                x0 >= ax0 && x1 <= ax1 && y0 >= ay0 && y1 <= ay1,
+                "tile ({x},{y}) is granted but not contained: {bbox:?}"
+            );
+            assert!(
+                permissive.iter().any(|(px, py, _)| px == x && py == y),
+                "tile ({x},{y}) contained but not intersecting"
+            );
+        }
+
+        // The sharpest case: tiles whose interior overlap with the licensed
+        // area is exactly zero, granted in full. Edge contact is enough.
+        let touching_only = permissive
+            .iter()
+            .filter(|(_, _, bbox)| {
+                let (x0, x1) = (bbox[0].min(bbox[2]), bbox[0].max(bbox[2]));
+                let (y0, y1) = (bbox[1].min(bbox[3]), bbox[1].max(bbox[3]));
+                let ox = x1.min(ax1) - x0.max(ax0);
+                let oy = y1.min(ay1) - y0.max(ay0);
+                ox <= 0.0 || oy <= 0.0
+            })
+            .count();
+        assert!(
+            touching_only > 0,
+            "expected tiles granted on edge contact alone"
+        );
+    }
+
     // ---- end to end, against a real file ------------------------------------
 
     // The whole stack -- TIFF, index, policy, decision -- over a 5 MB COG. The

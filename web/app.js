@@ -277,8 +277,17 @@ function extentOf(regions) {
 
 const sceneExtent = () => state.files.cog?.extent || SCENE_EXTENT;
 
+/** Level-0 tile bboxes of the loaded COG, for snapping a licensed area. */
+const tileBoxes = () =>
+  (state.files.cog?.regions || [])
+    .filter((r) => r.kind === 'tile' && r.overview_level === 0
+      && Array.isArray(r.bbox) && r.bbox.length === 4)
+    .map((r) => r.bbox);
+
 const currentAois = () =>
-  (state.source.mode === SAMPLES || !state.files.cog ? AOIS : aoisFor(sceneExtent()));
+  (state.source.mode === SAMPLES || !state.files.cog
+    ? AOIS
+    : aoisFor(sceneExtent(), tileBoxes()));
 
 function pickedAoi() {
   const aois = currentAois();

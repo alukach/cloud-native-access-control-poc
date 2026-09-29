@@ -32,11 +32,25 @@ allow:
   # are planar and CRS-agnostic (issue #5), so a polygon in degrees here would
   # match nothing and deny everything -- fail-closed, but for the wrong reason.
   #
-  # Its corners sit strictly inside tile boundaries rather than on them: the
-  # 512-pixel tiles of this file are 5,120 m across, and an AOI edge landing
-  # exactly on one would make the neighbouring tile *touch* the polygon, which
-  # `S_INTERSECTS` counts. This one grants tiles x 5-9, y 5-9 and nothing else,
-  # so the demo's arithmetic is exact.
+  # `S_CONTAINS(<area>, region.geom)` and NOT
+  # `S_INTERSECTS(region.geom, <area>)`. The difference is the whole rule.
+  #
+  # A tile is the unit of service: whichever predicate is used, a qualifying
+  # tile is served entire. `S_INTERSECTS` is a positive existential, so a tile
+  # qualifies on *any* contact with the area and its pixels outside the licence
+  # go out with it. Measured on this exact polygon --- which is the union of
+  # tiles x 5-9, y 5-9, edges lying on tile boundaries --- `S_INTERSECTS`
+  # grants 49 tiles where `S_CONTAINS` grants 25, and four of the extra 24
+  # touch the area along a single edge with zero interior overlap. See
+  # `s_intersects_grants_tiles_outside_the_area_and_s_contains_does_not` in
+  # src/cog.rs.
+  #
+  # `S_CONTAINS` errs the other way: an area smaller than one tile grants
+  # nothing at all. For a licence that is the correct direction to be wrong in,
+  # and it is why the polygon below is snapped to tile boundaries rather than
+  # drawn inside them --- a hand-drawn AOI will under-serve at the edges, which
+  # is a licensing conversation and not a leak.
   - >-
-    region.overview_level = 0 AND S_INTERSECTS(region.geom, POLYGON((
-      526000 4149000, 551000 4149000, 551000 4174000, 526000 4174000, 526000 4149000)))
+    region.overview_level = 0 AND S_CONTAINS(POLYGON((
+      525580 4148800, 551180 4148800, 551180 4174400, 525580 4174400, 525580 4148800)),
+      region.geom)

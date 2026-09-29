@@ -15,7 +15,7 @@ Parquet, COG, Zarr and Icechunk — enforced at an S3 gateway, using
 > scrubbed — works for every client measured, because its correctness does not
 > depend on how a client batches reads.
 >
-> 208 tests, two runnable gateways (`examples/gate.rs`, `examples/cog_gate.rs`),
+> 209 tests, two runnable gateways (`examples/gate.rs`, `examples/cog_gate.rs`),
 > and a browser demo. Not production software; it exists to decide whether
 > [multistore](https://github.com/developmentseed/multistore) should adopt the
 > approach. Background:
@@ -62,11 +62,15 @@ allow:
   - "region.kind = 'metadata'"
   - "region.kind = 'column_chunk' AND region.column NOT IN ('salary','ssn')"
   - "region.kind = 'tile' AND region.overview_level >= 2"
-  - "user.role = 'licensee' AND region.kind = 'tile' AND S_INTERSECTS(region.geom, POLYGON((...)))"
+  - "user.role = 'licensee' AND region.kind = 'tile' AND S_CONTAINS(POLYGON((...)), region.geom)"
 ```
 
 Those last two are the case worth demonstrating: anyone may browse overviews,
 full resolution only inside a licensed area.
+
+The argument order in that last rule is load-bearing. **`S_CONTAINS(<area>,
+region.geom)`, never `S_INTERSECTS(region.geom, <area>)`** — see
+[Why the spatial predicate is the rule](#why-the-spatial-predicate-is-the-rule).
 
 CQL2 because the audience already writes it against STAC, and because
 [cql2-rs](https://github.com/developmentseed/cql2-rs) evaluates it in-process
@@ -129,6 +133,51 @@ unclassified bytes and gets denied.
 `min(dictionary_page_offset, data_page_offset)`. Start at `data_page_offset`
 and the dictionary page falls outside every region — and for a low-cardinality
 column, the dictionary page *is* the set of distinct values.
+
+## Why the spatial predicate is the rule
+
+A tile is the unit of service. Whichever predicate a policy uses, a qualifying
+tile goes out **entire** — so the choice of predicate is the choice of how much
+ground outside the licence the reader receives.
+
+`S_INTERSECTS` is a positive existential: a tile qualifies on *any* contact
+with the allowed area. Measured on `data/s2-tci-512.tif`, against an area that
+is the exact union of tiles x 5–9, y 5–9 — edges lying on tile boundaries:
+
+| rule | level-0 tiles served | ground served |
+| --- | ---: | --- |
+| `S_CONTAINS(<area>, region.geom)` | **25** | exactly the 25 tiles drawn |
+| `S_INTERSECTS(region.geom, <area>)` | **49** | a 7×7 block, 96% more than licensed |
+
+Four of the 24 extra tiles meet the area along a single shared edge and overlap
+its interior by **zero**. They are served in full.
+
+This is the same defect the resolver already refuses at index time: `src/cog.rs`
+rejects a rotated `ModelTransformation` because an axis-aligned envelope
+"covers ground the tile does not show, and a rule written
+`S_INTERSECTS(region.geom, <allowed area>)` would then grant tiles whose pixels
+are outside." That refusal was right, and it was incomplete — the same
+fail-open arrives through the *predicate* on an unrotated file, where the crate
+cannot refuse it. All it can do is say which spelling is safe.
+
+`S_CONTAINS(<area>, region.geom)` is the monotone-safe spelling: a tile
+qualifies only if every one of its pixels is inside the area. It errs the other
+way — an area smaller than one tile grants nothing — which is the direction an
+access-control rule should err in.
+
+**Snapping the area outward to the tile grid is the other half.** With
+containment alone, an area drawn without regard to the grid under-serves at
+every edge. Snap it outward to the union of tiles it overlaps and the two
+spellings serve identical bytes — but now the polygon in the policy *states*
+the ground being served, instead of the predicate quietly widening it. The
+over-grant is not removed; it is moved somewhere a licensor can read it. That
+is what `examples/withhold-tiles.yaml` and the demo's presets both do.
+
+Pinned by `s_intersects_grants_tiles_outside_the_area_and_s_contains_does_not`
+in `src/cog.rs`. Note that this reasoning is specific to raster tiles; for
+GeoParquet, a row-group bbox is an envelope over scattered features and the
+same rule applies with far more force — one row group of global features has a
+near-world envelope, so `S_INTERSECTS` against it allows everything.
 
 ## Footer rewrite + scrub: the mode that works for every client
 
@@ -199,9 +248,11 @@ object-level decision made elsewhere.
 - **The AOI is recoverable.** Probing tile ranges and watching 403 versus 206
   recovers the licensed boundary at tile granularity. The AOI is often itself
   the sensitive thing.
-- **Data outside the AOI is delivered.** `S_INTERSECTS` at tile granularity
-  serves any tile *touching* the AOI in full. An AOI smaller than one tile
-  yields a whole tile.
+- **The unit of service is a tile, not the AOI.** A qualifying tile is served
+  entire, so the licensed area and the served ground never coincide exactly.
+  `S_CONTAINS` makes the error fail-closed and the policy document honest, but
+  it does not remove it — see
+  [Why the spatial predicate is the rule](#why-the-spatial-predicate-is-the-rule).
 - **The demo enforces nothing.** Policy, principal and interception all run in
   the browser, and the sample files are readable with `curl`. It visualizes a
   decision; it is not an enforcement point.
@@ -222,7 +273,7 @@ and `rustup` installs it automatically). For the browser demo you also need
 ### The crate
 
 ```sh
-cargo test          # 190 tests; the test names are the specification
+cargo test          # 209 tests; the test names are the specification
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -245,6 +296,7 @@ Worth reading by name, since each pins a bug that would otherwise have shipped:
 | `an_inline_column_metadata_does_not_survive_the_scrub_of_its_column` | parquet-cpp repeats a column's min/max below the footer |
 | `the_word_alignment_pad_after_an_odd_length_tag_value_is_not_unmapped` | one byte that denied every Sentinel-2 COG header read |
 | `withholding_a_groups_only_leaf_prunes_the_group_rather_than_emptying_it` | `num_children=0` silently reshapes the schema |
+| `s_intersects_grants_tiles_outside_the_area_and_s_contains_does_not` | 49 tiles served where 25 were licensed |
 
 ### The gateway
 
