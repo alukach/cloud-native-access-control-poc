@@ -369,12 +369,28 @@ and returns the whole object, which makes every measurement meaningless.
 
 ```sh
 wasm-pack build --release --target web --out-dir web/pkg
-npx serve .                        # from the repository root
-# then open the printed URL and append /web/
+npx serve web
 ```
 
-Serve from the repository root, not from `web/` — the page reads the sample
-files in `data/`.
+The sample files are **not** served locally. They live on
+[Source Cooperative](https://data.source.coop/alukach/alukach-experimentation/cloud-native-access-control/),
+so the page needs a network connection and the local server only has to serve
+the page itself. Two reasons, both about not letting the demo pass a test that
+real deployments fail:
+
+- **GitHub Pages applies `Range` after gzip.** A ranged request against a
+  compressed type returns a slice of the *compressed* stream with a
+  `Content-Range` against the compressed length. Browsers always send
+  `Accept-Encoding: gzip` and it is a Fetch-forbidden header, so this cannot be
+  worked around from JS.
+- **A cross-origin object exercises the CORS preflight**, which is where most
+  buckets actually fail. A same-origin sample would hide that.
+
+The gate is a **service worker**, which needs a secure context: `localhost`
+counts, a bare LAN IP does not.
+
+`serve.json` sets `Cache-Control: no-store`. Without it the browser runs
+whichever modules it cached, which looks exactly like the page being broken.
 
 You build a query, set a policy, and see what each client actually fetched.
 The query is a column picker taken from the loaded file's own schema; the
@@ -428,6 +444,11 @@ measure.
 > mis-parse it. This is exactly the RFC 9110 §14.2 behaviour described above,
 > and a good illustration of why a gateway must verify `Content-Range` on the
 > response rather than trusting that its request was honoured.
+
+That warning applies to the **gateway examples** and to anything you point at a
+local file. The demo page itself no longer serves sample data, so its local
+server only has to return the page — but the same rule holds the moment you
+give the page a `file=` URL of your own.
 
 Any server that implements byte ranges will do. Two that are already on most
 machines, both verified to return `206 Partial Content` here:

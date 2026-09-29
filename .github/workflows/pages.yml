@@ -33,9 +33,10 @@ jobs:
         run: |
           mkdir -p _site
           cp -r web/. _site/
-          # Sample files land here once Task 8 generates them. They must be
-          # served uncompressed with byte ranges or Live mode cannot work.
-          if [ -d data ]; then cp -r data _site/data; fi
+          # The samples are NOT deployed here. They live on Source Cooperative,
+          # because Pages applies Range after gzip and because a cross-origin
+          # object exercises the CORS preflight a same-origin one would not.
+          # See the SOURCE_COOP note in web/catalog.js.
 
       - uses: actions/upload-pages-artifact@v3
         with:
@@ -124,7 +125,24 @@ jobs:
           URL="https://${URL#http://}"
           echo "base URL: $URL"
           check "pkg/cnac_bg.wasm"
-          for f in data/*; do
-            [ -e "$f" ] && check "$f"
+
+          # The samples are hosted elsewhere, so check them where they actually
+          # are. This is the assertion that matters most now: the demo depends
+          # on a third party continuing to serve ranges and CORS, and if that
+          # changes the page breaks in a way that looks like a bug in this
+          # repository.
+          SC="https://data.source.coop/alukach/alukach-experimentation/cloud-native-access-control"
+          for f in paris-landmarks.tif nyc-taxi-8rg.parquet s2-tci-512.tif; do
+            echo "checking $SC/$f"
+            hdrs=$(curl -sS -o /dev/null -D- -m 30 \
+              -H 'Range: bytes=0-19' \
+              -H 'Origin: https://example.org' \
+              -H 'Accept-Encoding: gzip' "$SC/$f")
+            grep -qiE '^HTTP/[0-9.]+ 206' <<<"$hdrs" || {
+              echo "  FAIL: no 206"; grep -iE '^HTTP/|^content-range' <<<"$hdrs" | sed 's/^/    /'; fail=1; }
+            grep -qi '^content-encoding:' <<<"$hdrs" && {
+              echo "  FAIL: served compressed; a range would slice the compressed stream"; fail=1; }
+            grep -qi '^access-control-allow-origin:' <<<"$hdrs" || {
+              echo "  FAIL: no CORS header; a browser cannot read this"; fail=1; }
           done
           exit $fail

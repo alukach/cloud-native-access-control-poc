@@ -1,12 +1,30 @@
 // What the page offers before you bring your own: two files, a handful of
 // policies per format, and the ranges a real reader would actually ask for.
 
+/**
+ * Where the samples live.
+ *
+ * Source Cooperative rather than this repository's own Pages deployment, for
+ * two reasons that are both about honesty. Pages applies `Range` *after* gzip,
+ * so a ranged request against a compressed type returns a slice of the
+ * compressed stream -- and browsers always send `Accept-Encoding: gzip` and
+ * cannot be told not to. And a cross-origin object exercises the CORS
+ * preflight, which is where most buckets fail in practice; a same-origin
+ * sample would let the demo pass a test real deployments do not.
+ *
+ * Verified on these objects: `206` with the right `Content-Range`, no
+ * `content-encoding` even when gzip is offered, `access-control-allow-origin: *`
+ * and `access-control-expose-headers: *` so `Content-Range` is readable.
+ */
+const SOURCE_COOP =
+  'https://data.source.coop/alukach/alukach-experimentation/cloud-native-access-control';
+
 export const SAMPLES = [
   {
     id: 'paris',
     format: 'cog',
     name: 'Paris — landmarks',
-    path: '../data/paris-landmarks.tif',
+    path: `${SOURCE_COOP}/paris-landmarks.tif`,
     blurb: 'IGN orthophoto at 0.4 m, 476 tiles of 153 m each. The Eiffel Tower and the '
       + 'Arc de Triomphe are unmistakable, which is the point: when a policy withholds '
       + 'them you can see exactly what left.',
@@ -16,7 +34,7 @@ export const SAMPLES = [
     id: 'nyc-taxi',
     format: 'parquet',
     name: 'NYC taxi trips',
-    path: '../data/nyc-taxi-8rg.parquet',
+    path: `${SOURCE_COOP}/nyc-taxi-8rg.parquet`,
     blurb: '400,000 rows, 19 columns, 8 row groups. Sized so a 64 KiB block spans '
       + 'more than one column chunk, which is where every interesting problem starts.',
   },
@@ -24,7 +42,7 @@ export const SAMPLES = [
     id: 's2-tci',
     format: 'cog',
     name: 'Sentinel-2 granule',
-    path: '../data/s2-tci-512.tif',
+    path: `${SOURCE_COOP}/s2-tci-512.tif`,
     blurb: '5 MB, 6 overview levels, 655 tiles at 10 m. The licensing case rather than '
       + 'the redaction one: an area is granted, not withheld.',
   },
