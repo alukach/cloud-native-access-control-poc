@@ -130,33 +130,23 @@ export const POLICIES = {
     {
       id: 'hide-landmarks',
       name: 'Hide the landmarks',
-      blurb: 'Full resolution everywhere except over the Eiffel Tower and the Arc de '
-        + 'Triomphe. Zoom in and they are gone; zoom out and the overviews still show '
-        + 'them, coarsely — which the policy says out loud rather than hiding.',
+      blurb: 'The Eiffel Tower and the Arc de Triomphe withheld at every zoom level. '
+        + 'Overviews are built by averaging the level below, so the pixels over a '
+        + 'withheld location are present in the coarse tiles too — hiding it properly '
+        + 'means hiding those as well.',
+      build: () => doc([STRUCTURE, `region.kind = 'tile'\n     AND ${outside(LANDMARKS)}`]),
+    },
+    {
+      id: 'hide-high-detail',
+      name: 'Hide landmarks at high detail',
+      blurb: 'The same two locations withheld only at full resolution, with every '
+        + 'overview published. Zoom in and they are gone; zoom out and they are still '
+        + 'there, coarsely. That is the trade the rule above pays for, and stating it '
+        + 'in the policy is better than discovering it later.',
       build: () => doc([
         STRUCTURE,
         'region.overview_level > 0',
         `region.overview_level = 0\n     AND ${outside(LANDMARKS)}`,
-      ]),
-    },
-    {
-      id: 'hide-everywhere',
-      name: 'Hide them at every zoom',
-      blurb: 'The honest version, and what it costs. Overviews average the level below, '
-        + 'so hiding a location properly means hiding it in the coarse tiles too — and '
-        + 'one level-5 tile covers the whole city.',
-      build: () => doc([STRUCTURE, `region.kind = 'tile'\n     AND ${outside(LANDMARKS)}`]),
-    },
-    {
-      id: 'wrong-predicate',
-      name: 'The predicate written backwards',
-      blurb: 'The same intent with S_CONTAINS instead of S_INTERSECTS. It reads correctly '
-        + 'and it protects nothing at all: no 153 m tile fits inside a 205 m box, so every '
-        + 'landmark tile is served.',
-      build: () => doc([
-        STRUCTURE,
-        `region.kind = 'tile'\n     AND ${LANDMARKS.map((a) =>
-          `NOT S_CONTAINS(${ring(a.bbox)}, region.geom)`).join('\n     AND ')}`,
       ]),
     },
     {

@@ -1,0 +1,46 @@
+-- Hide two landmarks at full resolution only.
+--
+-- The partial version of `hide-landmarks.cql2`, kept because the difference
+-- between them is the thing worth seeing. Every overview is published, so the
+-- withheld locations remain visible at 1 m and coarser -- they are hidden from
+-- someone who zooms in and not from someone who does not.
+--
+-- Whether that is a restriction or a fig leaf depends entirely on what is being
+-- protected, and the only wrong version is the one where nobody noticed the
+-- difference. Compare the two in the demo: zoom out under this policy and the
+-- landmarks are still there.
+--
+-- Withheld on data/paris-landmarks.tif: 10 tiles, 138,368 bytes -- against 21
+-- tiles for the same two locations at every level.
+
+-- The structure, without which no reader can find any tile.
+region.kind = 'metadata'
+
+-- Every overview, published. This is the clause that makes the policy partial,
+-- and writing it explicitly is the point: the alternative is a rule that looks
+-- like it hides a location and does not. See `hide-landmarks.cql2` for the
+-- version that pays the other cost.
+OR region.overview_level > 0
+
+-- Full resolution, except where it is not.
+--
+-- `NOT S_INTERSECTS(region.geom, <area>)` and NOT
+-- `NOT S_CONTAINS(<area>, region.geom)`. The safe direction inverts with the
+-- direction of the rule, and it is worth being precise about why.
+--
+-- A tile is served whole. So when an area GRANTS access, a tile qualifies only
+-- if it is entirely inside -- `S_CONTAINS(<area>, region.geom)` -- or pixels
+-- outside the grant go out with it. When an area DENIES access, the same
+-- reasoning runs the other way: a tile must be withheld if it touches the area
+-- at all, because any overlap means some of the protected ground is in it.
+--
+-- Measured on this file: with `NOT S_INTERSECTS` the two landmarks withhold 21
+-- tiles. Written as `NOT S_CONTAINS(<area>, region.geom)` -- which reads like
+-- the same intent -- it withholds **nothing at all**, because no tile is
+-- wholly inside a 200 m box when the tiles are 153 m across. A rule that
+-- protects zero tiles and looks correct is the worst thing in this file.
+OR (region.overview_level = 0
+    AND NOT S_INTERSECTS(region.geom, POLYGON((
+      255320 6250770, 255525 6250770, 255525 6250975, 255320 6250975, 255320 6250770)))
+    AND NOT S_INTERSECTS(region.geom, POLYGON((
+      255350 6253350, 255610 6253350, 255610 6253600, 255350 6253600, 255350 6253350))))
