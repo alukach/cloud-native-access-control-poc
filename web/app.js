@@ -9,7 +9,7 @@
 
 import { open, supported } from './gate.js';
 import {
-  AREAS, POLICIES, SAMPLES, buildPolicy, policiesFor, sampleById, suggestedRanges,
+  AREAS, LANDMARKS, POLICIES, SAMPLES, buildPolicy, policiesFor, sampleById, suggestedRanges,
 } from './catalog.js';
 import { readersFor, readerById } from './readers.js';
 import { pack, unpack } from './share.js';
@@ -28,7 +28,7 @@ const bytes = (n) => (
       : `${n} B`
 );
 
-const PERMIT_ALL = 'allow:\n  - "1 = 1"\n';
+const PERMIT_ALL = '1 = 1';
 
 const state = {
   tab: 'inspect',
@@ -47,7 +47,36 @@ const state = {
   area: AREAS[0].id,
   reader: null,
   range: '',
+  /** The mounted map viewer, if the current reader is one. */
+  map: null,
 };
+
+/**
+ * The file's pixel grid, derived from its own tile bboxes.
+ *
+ * `map.js` works in image pixels, and the landmarks are written in the file's
+ * CRS, so something has to convert. Taking it from the index rather than from
+ * a hard-coded geotransform means it is right for any COG the page is pointed
+ * at, including somebody else's.
+ */
+function pixelGrid() {
+  const tiles = (state.file?.regions || [])
+    .filter((r) => r.kind === 'tile' && r.overview_level === 0 && Array.isArray(r.bbox));
+  if (!tiles.length) return null;
+  const xs = tiles.map((t) => Math.min(t.bbox[0], t.bbox[2]));
+  const ys = tiles.map((t) => Math.max(t.bbox[1], t.bbox[3]));
+  const originX = Math.min(...xs);
+  const originY = Math.max(...ys);
+  // Tile pitch, from the two smallest distinct x edges.
+  const distinct = [...new Set(xs)].sort((a, b) => a - b);
+  const pitch = distinct.length > 1 ? distinct[1] - distinct[0] : null;
+  if (!pitch) return null;
+  // The COG's block size in pixels is the pitch divided by the ground
+  // resolution; 256 is what `scripts/make-paris.sh` writes and what the
+  // suggested-range helper assumes.
+  const res = pitch / 256;
+  return { originX, originY, res };
+}
 
 // ---- the file -------------------------------------------------------------
 
@@ -75,6 +104,9 @@ async function loadFile() {
   state.lens = null;
   state.gate = null;
   state.file = null;
+  state.map?.destroy();
+  state.map = null;
+  $('map-host').textContent = '';
 
   try {
     state.lens = await open({
@@ -434,10 +466,14 @@ function renderReaders() {
   $('reader-note').textContent = reader?.note || '';
   $('query-sql').hidden = reader?.ui !== 'sql';
   $('query-map').hidden = reader?.ui !== 'map';
-  $('query-sub').textContent = reader?.ui === 'sql'
-    ? 'The engine reads the file over HTTP. It is not told about the policy — whatever it '
-      + 'can see is what the gate served it.'
-    : 'The reader decodes pixels straight from the file. Whatever renders is what the gate served.';
+  $('query-deck').hidden = reader?.ui !== 'deck';
+  $('query-sub').textContent = {
+    sql: 'The engine reads the file over HTTP. It is not told about the policy — whatever '
+      + 'it can see is what the gate served it.',
+    deck: 'Pan and zoom the image. Every tile on screen is its own range request through '
+      + 'the gate; a withheld tile comes back black.',
+    map: 'The reader decodes one whole level. Whatever renders is what the gate served.',
+  }[reader?.ui] || '';
 
   if (reader?.ui === 'sql' && !$('sql').value.trim()) {
     $('sql').value = reader.defaultQuery('{table}');
@@ -457,6 +493,29 @@ function renderReaders() {
       select.value = String(levels[levels.length - 1] ?? 0);
     }
   }
+}
+
+/** Shortcuts to the places the policy is about. */
+function renderJumps() {
+  const host = $('map-jump');
+  host.textContent = '';
+  const grid = pixelGrid();
+  if (!grid || !state.map || state.sample !== 'paris' || state.url) return;
+  host.append(el('span', 'jump-label', 'Jump to'));
+  for (const place of LANDMARKS) {
+    const chip = el('button', 'chip', place.name);
+    chip.type = 'button';
+    chip.addEventListener('click', () => {
+      const cx = (place.bbox[0] + place.bbox[2]) / 2;
+      const cy = (place.bbox[1] + place.bbox[3]) / 2;
+      state.map.flyTo((cx - grid.originX) / grid.res, (grid.originY - cy) / grid.res, -0.5);
+    });
+    host.append(chip);
+  }
+  const out = el('button', 'chip', 'The whole scene');
+  out.type = 'button';
+  out.addEventListener('click', () => state.map.fit());
+  host.append(out);
 }
 
 async function openGate() {
@@ -493,6 +552,21 @@ async function runQuery() {
       return;
     }
     const reader = readerById(state.reader);
+    if (reader.ui === 'deck') {
+      if (state.map) {
+        await state.map.update(gate.url);
+      } else {
+        state.map = await reader.mount($('map-host'), {
+          url: gate.url,
+          onStatus: (m) => { $('map-status').textContent = m; },
+        });
+      }
+      renderJumps();
+      diag.className = 'diag ok';
+      diag.textContent = 'The map is reading through the gate. Pan and zoom — every tile '
+        + 'on screen is a range request, and a withheld one comes back black.';
+      return;
+    }
     const result = await reader.run({
       url: gate.url,
       query: $('sql').value,

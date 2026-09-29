@@ -81,9 +81,24 @@ export const READERS = [
     },
   },
   {
+    id: 'deck',
+    name: 'Map view',
+    how: 'deck.gl, tile by tile',
+    formats: ['cog'],
+    ui: 'deck',
+    note: 'Pan and zoom. Every tile on screen is a separate range request through the '
+      + 'gate, at whatever overview level the zoom calls for — so a policy that '
+      + 'withholds a location has to withhold it at every level, and you can see '
+      + 'immediately when it does not.',
+    async mount(container, options) {
+      const { mountMap } = await import('./map.js');
+      return mountMap(container, options);
+    },
+  },
+  {
     id: 'geotiff',
     name: 'geotiff.js',
-    how: 'reads and decodes pixels',
+    how: 'one read, whole level',
     formats: ['cog'],
     ui: 'map',
     note: 'Block-aligns its reads to 64 KiB unless told otherwise, which is the same '

@@ -3,42 +3,60 @@
 :root {
   color-scheme: light dark;
 
-  --paper: #eef1f6;
-  --surface: #fbfcfe;
-  --sunk: #e4e9f1;
-  --rule: #c9d2de;
-  --ink: #131922;
-  --ink-2: #55606f;
-  --ink-3: #7b8697;
+  /* Development Seed's palette: #D04200 orange, #444 charcoal, white.
+     The orange carries meaning here rather than decoration -- it is the colour
+     of a withheld byte, which is what this page is about -- and it doubles as
+     the interactive accent, where the shape (a filled control) keeps the two
+     readings apart. */
+  --brand: #d04200;
+  --brand-ink: #ffffff;
 
-  --allow: #1f5fbf;
-  --allow-soft: #cfe0f8;
-  --deny: #b3560c;
-  --deny-soft: #f7dfc4;
-  --struct: #6b5bb5;
-  --struct-soft: #ded8f5;
+  --paper: #f4f4f4;
+  --surface: #ffffff;
+  --sunk: #ebebeb;
+  --rule: #d8d8d8;
+  --ink: #1a1a1a;
+  --ink-2: #555555;
+  --ink-3: #888888;
+
+  /* Allowed, withheld, and the structure a reader needs to find either. */
+  --allow: #1d6996;
+  --allow-soft: #d7e7f3;
+  --deny: #d04200;
+  --deny-soft: #ffe0cf;
+  --brand-soft: #ffe8dc;
+  --struct: #6a5a8c;
+  --struct-soft: #e5dfef;
 
   --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --radius: 6px;
 }
 
+/* No published dark palette to copy, so this is built to the same relations:
+   the orange lightened enough to hold contrast on a dark ground, and the
+   neutrals left neutral so the only colour on the page is carrying
+   information. */
 @media (prefers-color-scheme: dark) {
   :root {
-    --paper: #0d1219;
-    --surface: #151c26;
-    --sunk: #0a0f15;
-    --rule: #2a3440;
-    --ink: #e4eaf2;
-    --ink-2: #98a4b4;
-    --ink-3: #6c7889;
+    --brand: #ff6b2c;
+    --brand-ink: #0d0d0d;
 
-    --allow: #5d9df2;
-    --allow-soft: #1b3554;
-    --deny: #e29450;
-    --deny-soft: #452c14;
-    --struct: #a998ea;
-    --struct-soft: #2c2450;
+    --paper: #0d0d0d;
+    --surface: #171717;
+    --sunk: #050505;
+    --rule: #2b2b2b;
+    --ink: #f2f2f2;
+    --ink-2: #a8a8a8;
+    --ink-3: #767676;
+
+    --allow: #62a8da;
+    --allow-soft: #17374d;
+    --deny: #ff6b2c;
+    --deny-soft: #42200c;
+    --brand-soft: #3a1a08;
+    --struct: #a697ce;
+    --struct-soft: #302945;
   }
 }
 
@@ -54,7 +72,7 @@ body {
 }
 
 code { font-family: var(--mono); font-size: 0.875em; overflow-wrap: anywhere; }
-a { color: var(--allow); }
+a { color: var(--brand); }
 
 /* ---- chrome ------------------------------------------------------------ */
 
@@ -98,7 +116,7 @@ a { color: var(--allow); }
 .tabs button[aria-selected="true"] {
   background: var(--paper);
   color: var(--ink);
-  border-top-color: var(--allow);
+  border-top-color: var(--brand);
 }
 
 .file-bar {
@@ -164,14 +182,14 @@ input[type="text"], select, textarea {
 }
 
 textarea { width: 100%; resize: vertical; line-height: 1.45; }
-input[type="text"]:focus, textarea:focus, select:focus { outline: 2px solid var(--allow); outline-offset: -1px; }
+input[type="text"]:focus, textarea:focus, select:focus { outline: 2px solid var(--brand); outline-offset: -1px; }
 
 button { font-family: var(--sans); }
 
 .go {
-  border: 1px solid var(--allow);
-  background: var(--allow);
-  color: #fff;
+  border: 1px solid var(--brand);
+  background: var(--brand);
+  color: var(--brand-ink);
   border-radius: 4px;
   padding: 7px 14px;
   font-size: 13px;
@@ -201,7 +219,7 @@ button { font-family: var(--sans); }
 
 .chip b { font-size: 12px; font-weight: 600; }
 .chip span { font-size: 11px; color: var(--ink-3); }
-.chip.on { border-color: var(--allow); background: var(--allow-soft); }
+.chip.on { border-color: var(--brand); background: var(--brand-soft, var(--sunk)); box-shadow: inset 0 0 0 1px var(--brand); }
 .chip.on span { color: var(--ink-2); }
 
 span.chip { cursor: default; font-family: var(--mono); }
@@ -228,10 +246,14 @@ span.chip { cursor: default; font-family: var(--mono); }
 }
 
 .toggle button span { display: block; font-size: 11px; font-weight: 400; color: var(--ink-3); }
-.toggle button[aria-checked="true"] { border-color: var(--allow); background: var(--allow-soft); }
+.toggle button[aria-checked="true"] {
+  border-color: var(--brand);
+  box-shadow: inset 0 0 0 1px var(--brand);
+}
 
 .diag { margin-top: 8px; font-size: 12px; font-family: var(--mono); color: var(--ink-3); min-height: 1em; }
 .diag.ok { color: var(--allow); }
+.diag.bad { color: var(--deny); }
 .diag.bad { color: var(--deny); }
 
 .runbar { display: flex; gap: 12px; align-items: center; margin-top: 14px; }
@@ -279,9 +301,9 @@ span.chip { cursor: default; font-family: var(--mono); }
 }
 
 .suggestion b { display: block; font-size: 12px; }
-.suggestion code { display: block; margin: 3px 0 5px; font-size: 11px; color: var(--allow); }
+.suggestion code { display: block; margin: 3px 0 5px; font-size: 11px; color: var(--brand); }
 .suggestion span { display: block; font-size: 11px; line-height: 1.4; color: var(--ink-3); }
-.suggestion:hover { border-color: var(--allow); }
+.suggestion:hover { border-color: var(--brand); }
 
 .regions { max-height: 340px; overflow-y: auto; border: 1px solid var(--rule); border-radius: 4px; }
 
@@ -358,4 +380,33 @@ span.chip { cursor: default; font-family: var(--mono); }
   .split, .two-up { grid-template-columns: minmax(0, 1fr); }
   .tabs { grid-template-columns: minmax(0, 1fr); }
   main, footer, .top, .file-bar { padding-left: 16px; padding-right: 16px; }
+}
+
+/* ---- the map view ------------------------------------------------------ */
+
+.map-host {
+  position: relative;
+  height: 520px;
+  margin-top: 10px;
+  background: var(--sunk);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  overflow: hidden;
+  /* deck.gl's controller wants the wheel and the drag. */
+  touch-action: none;
+  cursor: grab;
+}
+
+.map-host:active { cursor: grabbing; }
+.map-host canvas { border-radius: 3px; }
+
+@media (max-width: 860px) { .map-host { height: 380px; } }
+
+.jump-label {
+  align-self: center;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-right: 2px;
 }
