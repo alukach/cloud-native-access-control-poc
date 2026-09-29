@@ -164,10 +164,21 @@ const policy = (lines) => `allow:\n${lines.map((l) => `  - "${l}"`).join('\n')}\
 const METADATA = "region.kind = 'metadata'";
 /** The two columns the bundled Parquet withholds, and the default for any file. */
 export const WITHHELD = ['tip_amount', 'total_amount'];
+// A rule about the COLUMN, not about a region kind.
+//
+// A column owns three kinds of region -- `column_chunk`, `column_index` and
+// `bloom_filter` -- and this rule has to permit all three. Written as
+// `region.kind = 'column_chunk' AND region.column NOT IN (...)` it permits
+// only the chunks, which under refusal looks almost right (a page-index read
+// is refused, and the matrix shows it) and under a write path withholds
+// **every column in the file**: a column is withheld if any of its regions is
+// denied, so seventeen of nineteen disappear from the rewritten footer.
+//
+// Issue #26 is the same mistake from the other side: withholding a permitted
+// column's bloom filter breaks DuckDB equality predicates with a
+// corruption-shaped error. Name the column.
 const COLUMN_MASK = (withheld) =>
-  `region.kind = 'column_chunk' AND region.column NOT IN (${
-    withheld.map((c) => `'${c}'`).join(', ')
-  })`;
+  withheld.map((c) => `region.column <> '${c}'`).join(' AND ');
 const OVERVIEWS = "region.kind = 'tile' AND region.overview_level >= 2";
 // `S_CONTAINS(<area>, region.geom)`, argument order deliberate: the area
 // contains the tile, not the other way round. See the note at the top of this

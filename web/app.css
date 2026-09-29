@@ -286,7 +286,7 @@ button.run {
 
 .matrix {
   display: grid;
-  grid-template-columns: minmax(9rem, 14rem) minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: minmax(9rem, 14rem) repeat(3, minmax(0, 1fr));
   gap: 1px;
   background: var(--rule);
   border: 1px solid var(--rule);
@@ -659,3 +659,51 @@ table.log .why { color: var(--ink-2); }
 .note strong { color: var(--ink); }
 
 .busy { color: var(--ink-3); font-family: var(--mono); font-size: 0.71875rem; }
+
+/* ---- the filtered view card ------------------------------------------- */
+
+.card.filtered { margin-bottom: 16px; }
+
+/* Four facts about the served view, side by side and wrapping on a phone. */
+.facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 12px;
+}
+
+.fact {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 140px;
+  padding: 8px 10px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: var(--sunk);
+}
+
+.fact-label {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.fact-value {
+  font-family: var(--mono);
+  font-size: 13px;
+  /* An ETag is long and must not widen the row past its share. */
+  overflow-wrap: anywhere;
+}
+
+.fact-note { font-size: 11px; color: var(--ink-3); }
+
+/* A column the served footer no longer names. Struck through rather than
+   hidden: the point is that it was there and is not. */
+.chip.gone {
+  text-decoration: line-through;
+  color: var(--ink-3);
+  border-style: dashed;
+  background: transparent;
+}

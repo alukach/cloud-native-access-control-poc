@@ -373,14 +373,32 @@ the projected client flips to *fails* — and note it fails with **nothing
 straddling**, a flat refusal rather than a boundary crossing, which is a
 different failure worth being able to tell apart.
 
-**The denial mode is the design decision.** A gate can refuse any request
-covering forbidden bytes, or serve it with those bytes blanked. The crate
-supports both (`DenialMode`); the page currently runs refuse-only and says so.
-Which one you need is not a preference — it depends on the client. A projecting
-engine never parses the blanked bytes, so zero-fill is lossless for it; a client
-that reads every column parses the zeros and gets corrupt data instead of a
-clean refusal. Footer rewrite removes the dependence on the client entirely, by
-making the withheld columns invisible rather than forbidden — see above.
+**The denial mode is the design decision, and the page now runs both.** Pick
+*Refuse the request* or *Serve a filtered view* and press run; the matrix keeps
+one measurement per mode, so the two sit side by side rather than replacing
+each other. Measured here against the bundled files:
+
+| client | refuse | serve a filtered view |
+| --- | --- | --- |
+| hyparquet, no projection | **fails** — 8 of 10 ranges refused | **completes** — 8 of 10 cover withheld bytes, all served |
+| hyparquet, columns pushed down | completes — 34 chunk-exact ranges | completes |
+| geotiff.js, 64 KB blocks | **fails** — 2 of 3 ranges refused | **completes** — 2 of 3 cover withheld bytes, all served |
+| geotiff.js, one structure per range | completes — 13 exact ranges | completes |
+
+That is the whole argument in one table. The clients that fail under refusal
+are the ones reading in fixed blocks, and they are the defaults. Under a
+filtered view the same reads succeed *because they cover withheld bytes and it
+does not matter* — nothing in the served metadata points at the hole.
+
+A **Stored, and served** card appears beside each result: the object's length
+against the view's, the bytes zeroed, the synthesized ETag, and the columns
+struck through that the served footer no longer names. When the policy cannot
+be expressed as a view — a rule denying `region.kind = 'metadata'`, say — the
+card says so instead, which is issue #27 surfacing where an author can act on
+it rather than in a log.
+
+Zero-fill is still not wired, and the page will not print a result it did not
+measure.
 
 > **Do not use `python3 -m http.server`.** It ignores `Range` entirely and
 > answers `200` with the whole file (measured: a request for 20 bytes returns

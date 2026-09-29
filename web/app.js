@@ -9,6 +9,7 @@ import {
   BLOCK_SIZE,
   Policy,
   buildIndex,
+  makeFilteredGate,
   makeGate,
   probe,
   queryables,
@@ -107,8 +108,21 @@ const runnableClients = (key) => clientsFor(key).filter((c) => !c.pending);
  */
 const DENIALS = [
   { id: 'refuse', name: 'Refuse it', summary: 'refuse mixed requests' },
+  {
+    id: 'filter',
+    name: 'Serve a filtered view',
+    summary: 'serve a filtered view',
+    // The mode this project recommends. `rewrite` for Parquet, `sparsify` for
+    // a COG: withheld bytes zeroed in place and the metadata rebuilt so
+    // nothing points at them. No request is refused, so coalescing stops
+    // mattering -- there is no hole any reader can find.
+    filter: true,
+  },
   { id: 'zerofill', name: 'Zero-fill', summary: 'zero-fill mixed requests', pending: true },
 ];
+
+/** Is the selected mode the one that serves rather than refuses? */
+const filtering = () => DENIALS.find((d) => d.id === state.denial)?.filter === true;
 
 /** The disclosures whose open/closed state travels in the link. */
 const PANELS = ['source', 'log'];
@@ -126,6 +140,9 @@ const state = {
   /** The picked Parquet columns, in the file's own order. */
   columns: [],
   denial: 'refuse',
+  /** `Filtered` handles by file key, and the error when a plan was refused. */
+  plans: {},
+  planErrors: {},
   // `mode` is SAMPLES or 'custom'. `format` is the override, 'auto' or a
   // format id -- what the *user* said, kept apart from what the URL implies.
   source: { mode: SAMPLES, url: '', format: 'auto' },
@@ -356,6 +373,9 @@ async function copyLink() {
 function loadPolicy() {
   const body = $('policy').value;
   state.policyText = body;
+  // A plan is a function of the policy and the principal, so both moving
+  // invalidates it. Cheaper to discard than to compare.
+  discardPlans();
   let next = null;
   try {
     next = new Policy(body);
@@ -390,6 +410,13 @@ function loadPolicy() {
     state.userError = String(err.message || err);
     $('principal-diag').className = 'diag bad';
     $('principal-diag').textContent = state.userError;
+  }
+
+  // After `state.user` is set above, so a stamp comparison is against the
+  // principal now in the editor rather than the previous one.
+  for (const key of Object.keys(state.files)) {
+    renderMatrix(key);
+    renderFiltered(key);
   }
 
   refreshVerdicts();
@@ -453,6 +480,7 @@ function toggleColumn(column) {
   state.columns = file.columns.filter((c) => picked.has(c));
   // The picked set changed, so every run on screen was for a different query.
   file.runs = {};
+  file.byMode = {};
   state.logPick = null;
   renderColumnChips();
   renderQuery();
@@ -554,9 +582,11 @@ function renderRunBar() {
         el('b', '', `${state.columns.length} of ${pq.columns.length} columns`),
         text(` over ${pq.rowsLabel}, against a policy withholding `),
         el('b', '', withheld.length ? listOf(withheld) : 'nothing'),
-        text(`, ${state.denial === 'refuse'
-          ? 'refusing any request that covers both'
-          : 'blanking the forbidden bytes'}.`),
+        text(`, ${{
+          refuse: 'refusing any request that covers both',
+          filter: 'serving a rewritten footer with those bytes zeroed',
+          zerofill: 'blanking the forbidden bytes',
+        }[state.denial]}.`),
       );
     }
     if (cog) {
@@ -769,11 +799,39 @@ const ZERO_FILL_CELL = {
   why: 'the crate can blank the forbidden bytes now; this page has not run a reader against it, and will not print an outcome it did not measure',
 };
 
-function refuseCell(file, run) {
-  if (!run) {
-    return { tone: 'idle', verdict: 'not run yet', why: 'press Run this query' };
+/**
+ * One cell: what happened to this client in this mode.
+ *
+ * A run belongs to the mode it ran in. Only one mode runs at a time, so a
+ * cell for any other mode says so rather than borrowing the result -- a
+ * filtered-view run printed under "refuse" would invert the page's central
+ * finding.
+ */
+function modeCell(run, mode) {
+  const stale = run && run.stamp !== `${state.policyText}\u0000${state.user}`;
+  if (!run || run.mode !== mode || stale) {
+    return {
+      tone: 'idle',
+      verdict: stale ? 'policy changed' : 'not run in this mode',
+      why: stale
+        ? 'this was measured against a different policy or principal'
+        : mode === state.denial
+          ? 'press Run this query'
+          : `select “${DENIALS.find((d) => d.id === mode)?.name}” above and run it`,
+    };
   }
   if (run.ok) {
+    if (mode === 'filter') {
+      const crossing = run.log.filter((e) => e.wouldRefuse).length;
+      return {
+        tone: 'good',
+        verdict: 'completes',
+        why: crossing
+          ? `${crossing} of ${run.issued} ranges cover withheld bytes and every one is served. `
+            + 'Under refuse each is a 403.'
+          : `${run.issued} ranges, none covering withheld bytes`,
+      };
+    }
     return {
       tone: 'good',
       verdict: 'completes',
@@ -785,7 +843,9 @@ function refuseCell(file, run) {
   return {
     tone: 'bad',
     verdict: 'fails',
-    why: `${run.denied} of ${run.issued} ranges refused. ${run.detail}`,
+    why: mode === 'filter'
+      ? run.detail
+      : `${run.denied} of ${run.issued} ranges refused. ${run.detail}`,
   };
 }
 
@@ -807,7 +867,7 @@ function renderMatrix(key) {
   const file = state.files[key];
   if (!file) return;
 
-  const columns = ['Client', 'Refuse the request', 'Zero-fill'];
+  const columns = ['Client', 'Refuse the request', 'Serve a filtered view', 'Zero-fill'];
   for (const label of columns) {
     const head = el('div', 'mh');
     head.append(el('div', 'lbl', label));
@@ -819,11 +879,14 @@ function renderMatrix(key) {
     who.append(el('div', 'who', client.name), el('div', 'how', client.how));
     host.append(who);
     const pending = { tone: 'idle pending', verdict: 'pending', why: client.pending };
+    const forMode = (mode) => file.byMode?.[`${mode}:${client.id}`];
     host.append(matrixCell(
-      client.pending ? pending : refuseCell(file, file.runs?.[client.id]),
-      columns[1],
+      client.pending ? pending : modeCell(forMode('refuse'), 'refuse'), columns[1],
     ));
-    host.append(matrixCell(client.pending ? pending : ZERO_FILL_CELL, columns[2]));
+    host.append(matrixCell(
+      client.pending ? pending : modeCell(forMode('filter'), 'filter'), columns[2],
+    ));
+    host.append(matrixCell(client.pending ? pending : ZERO_FILL_CELL, columns[3]));
   }
 }
 
@@ -1059,22 +1122,198 @@ function explain(file, gate, err) {
   }. Denied by ${names}.`;
 }
 
+/**
+ * The filtered view for one file, planned once and reused across clients.
+ *
+ * Returns `null` when the policy cannot be expressed in this mode -- issue #27
+ * -- and keeps the message, because showing *why* a rule that works under
+ * refusal cannot be honoured by a write path is the thing that most needs
+ * showing. A policy denying `region.kind = 'metadata'` is the common case: it
+ * is load-bearing under refuse and unrepresentable here, and silently serving
+ * the footer anyway would be widening access.
+ */
+const fmtBytes = (n) => (
+  n >= 1e6 ? `${(n / 1e6).toFixed(2)} MB`
+    : n >= 1e3 ? `${(n / 1e3).toFixed(1)} kB`
+      : `${n} B`
+);
+
+/**
+ * Stored beside served: what the policy took out, and what the object became.
+ *
+ * Everything here is read off the `Filtered` handle rather than recomputed, so
+ * the card cannot disagree with the bytes the gate actually served.
+ */
+function renderFiltered(key) {
+  const host = $(`${key}-filtered`);
+  if (!host) return;
+  const file = state.files[key];
+  host.textContent = '';
+
+  if (!filtering()) {
+    host.hidden = true;
+    return;
+  }
+  host.hidden = false;
+
+  // Plan here rather than waiting for a run: switching the mode should show
+  // what the mode would do, including when it refuses the policy outright.
+  planFor(key);
+
+  if (state.planErrors[key]) {
+    host.append(el('div', 'lbl', 'This policy cannot be served as a filtered view'));
+    host.append(el('p', 'diag bad', state.planErrors[key]));
+    host.append(el('p', 'preset-note',
+      'Issue #27. A write path must serve the structure a reader finds the '
+      + 'permitted data through, so a rule denying it cannot be honoured here '
+      + '— and serving it anyway would hand out bytes the policy denied. '
+      + 'Permit the structure explicitly, or use refuse mode.'));
+    return;
+  }
+
+  const plan = state.plans[key];
+  if (!plan || !file) return;
+
+  const report = JSON.parse(plan.withheld);
+  const shrunk = plan.originalSize - plan.virtualSize;
+  const scrub = plan.scrub;
+  let scrubbed = 0;
+  for (let i = 0; i < scrub.length; i += 2) scrubbed += scrub[i + 1] - scrub[i];
+
+  host.append(el('div', 'lbl', key === 'parquet'
+    ? 'Stored, and served — the footer rewritten, the withheld bytes zeroed'
+    : 'Stored, and served — the tile arrays sparsified, the withheld tiles zeroed'));
+
+  const facts = el('div', 'facts');
+  const fact = (label, value, note) => {
+    const box = el('div', 'fact');
+    box.append(el('span', 'fact-label', label));
+    box.append(el('span', 'fact-value', value));
+    if (note) box.append(el('span', 'fact-note', note));
+    facts.append(box);
+  };
+  fact('In storage', fmtBytes(plan.originalSize));
+  fact('Served as', fmtBytes(plan.virtualSize),
+    shrunk > 0 ? `${fmtBytes(shrunk)} shorter` : 'every offset preserved');
+  fact('Zeroed', fmtBytes(scrubbed),
+    `${scrub.length / 2} span${scrub.length === 2 ? '' : 's'}`);
+  fact('ETag', plan.etag, 'synthesized for the view, not the object');
+  host.append(facts);
+
+  if (report.kind === 'columns') {
+    const list = el('div', 'chips');
+    for (const column of file.columns) {
+      const withheld = report.withheld.find((w) => w.column === column);
+      const chip = el('span', withheld ? 'chip gone' : 'chip', column);
+      if (withheld) {
+        chip.title = `withheld: ${withheld.deniedKinds.join(', ')} — `
+          + `${withheld.regions} regions, ${fmtBytes(withheld.bytes)}`;
+      }
+      list.append(chip);
+    }
+    host.append(list);
+    const notes = [
+      `${report.withheld.length} of ${file.columns.length} columns are absent from the `
+      + 'served footer: no statistics, no bloom-filter pointer, no page-index pointer, '
+      + 'and no name anywhere in it.',
+    ];
+    if (report.groupsPruned?.length) {
+      notes.push(`Schema groups pruned: ${report.groupsPruned.join(', ')}.`);
+    }
+    if (report.strippedKeys?.length) {
+      notes.push(`key_value_metadata stripped: ${report.strippedKeys.join(', ')} — `
+        + 'ARROW:schema names every original column, so leaving it in would leak them.');
+    }
+    for (const note of notes) host.append(el('p', 'preset-note', note));
+  } else {
+    // `blankedBytes` counts the tile-array edits as well as the payloads, so
+    // it is a few bytes above the scrub total shown in the facts. Reporting
+    // both without saying why reads as an inconsistency.
+    const arrays = report.blankedBytes - scrubbed;
+    host.append(el('p', 'preset-note',
+      `${report.withheld.length} tiles withheld. Their TileOffsets and TileByteCounts `
+      + `entries — ${fmtBytes(arrays)} across the IFDs — are zero in the served file, which `
+      + 'is how a COG says a tile was never written. GDAL reads it as sparse, not as '
+      + 'corrupt. The tile payloads themselves are the '
+      + `${fmtBytes(scrubbed)} zeroed in place.`));
+  }
+
+  const run = file.runs && Object.values(file.runs)[0];
+  if (run) {
+    const crossing = run.log.filter((e) => e.wouldRefuse).length;
+    if (crossing) {
+      host.append(el('p', 'preset-note',
+        `${crossing} of ${run.log.length} reads in the last run covered withheld bytes. `
+        + 'Under refuse each one is a 403; here each one is served, and correct. That is the '
+        + 'whole difference: correctness stops depending on how the client batches reads.'));
+    }
+  }
+}
+
+function planFor(key) {
+  if (state.plans[key]) return state.plans[key];
+  if (state.planErrors[key]) return null;
+  const file = state.files[key];
+  if (!file || !state.policy) return null;
+  try {
+    state.plans[key] = file.index.plan(state.policy, state.user);
+    delete state.planErrors[key];
+  } catch (err) {
+    state.planErrors[key] = err?.message || String(err);
+    return null;
+  }
+  return state.plans[key];
+}
+
+/** Drop every plan. Called whenever the policy or the principal changes. */
+function discardPlans() {
+  for (const plan of Object.values(state.plans)) plan?.free?.();
+  state.plans = {};
+  state.planErrors = {};
+}
+
 async function runClient(key, client) {
   const file = state.files[key];
   file.runs ??= {};
+  // `runs` is the current mode's run, which is what the bars, the refusal
+  // cards and the log all want. `byMode` keeps one per mode so the matrix can
+  // show refuse beside filtered instead of only the last thing run.
+  file.byMode ??= {};
   delete file.runs[client.id];
   renderBars(key);
   renderMatrix(key);
   $('run-busy').textContent = `${key} · ${client.name}, ${client.how}…`;
 
-  const gate = makeGate({
+  const shared = {
     index: file.index,
     policy: state.policy,
     user: state.user,
     url: file.url,
     labels: (regions) => summarise(file, regions),
     onRequest: (entry) => markRequest(file, client.id, entry),
-  });
+  };
+  const plan = filtering() ? planFor(key) : null;
+  if (filtering() && !plan) {
+    // The plan was refused. That is a result, so record it as one rather than
+    // running a client against a view that does not exist.
+    file.runs[client.id] = {
+      mode: state.denial,
+      stamp: `${state.policyText}\u0000${state.user}`,
+      issued: 0, straddling: 0, denied: 0, bytes: 0, transferred: 0,
+      fullBodies: 0, checkMs: 0, log: [], ok: false, ms: 0,
+      detail: `This policy cannot be served as a filtered view: ${state.planErrors[key]}`,
+    };
+    file.byMode[`${state.denial}:${client.id}`] = file.runs[client.id];
+    $('run-busy').textContent = '';
+    renderBars(key);
+    renderMatrix(key);
+    renderFiltered(key);
+    return;
+  }
+  const gate = plan ? makeFilteredGate({ ...shared, filtered: plan }) : makeGate(shared);
+  // A rewritten Parquet is shorter than its object, and a reader told the
+  // original length seeks past its own footer.
+  const readerSize = plan ? plan.virtualSize : file.size;
 
   const started = performance.now();
   let ok = false;
@@ -1084,7 +1323,7 @@ async function runClient(key, client) {
       const columns = state.columns.length ? state.columns : file.columns.slice(0, 1);
       const { rows } = await runParquet({
         gate,
-        size: file.size,
+        size: readerSize,
         columns,
         aligned: client.aligned,
         rowEnd: file.rowEnd,
@@ -1100,7 +1339,7 @@ async function runClient(key, client) {
       const bbox = aoiBboxFrom(state.policyText) || sceneExtent();
       const result = await runCog({
         gate,
-        size: file.size,
+        size: readerSize,
         level,
         bbox,
         aligned: client.aligned,
@@ -1115,6 +1354,12 @@ async function runClient(key, client) {
   }
 
   file.runs[client.id] = {
+    mode: state.denial,
+    // What was measured. A cell whose stamp no longer matches the editor is
+    // not shown: the matrix is a comparison now, and refuse-fails from one
+    // policy printed beside filter-completes from another is worse than an
+    // empty cell.
+    stamp: `${state.policyText}\u0000${state.user}`,
     issued: gate.issued,
     straddling: gate.straddling,
     denied: gate.denied,
@@ -1128,10 +1373,13 @@ async function runClient(key, client) {
     ms: Math.round(performance.now() - started),
   };
 
+  file.byMode[`${state.denial}:${client.id}`] = file.runs[client.id];
+
   $('run-busy').textContent = '';
   renderBars(key);
   renderMatrix(key);
   renderRefusals(key);
+  renderFiltered(key);
   renderLog();
 }
 
@@ -1402,6 +1650,7 @@ function setDenial(id) {
     $(`deny-${option.id}`).setAttribute('aria-checked', String(option.id === denial.id));
   }
   renderRunBar();
+  for (const key of Object.keys(state.files)) renderFiltered(key);
 }
 
 function applyPreset(preset) {
@@ -1564,6 +1813,7 @@ async function boot() {
     writeUrl();
   });
   $('deny-refuse').addEventListener('click', () => { setDenial('refuse'); writeUrl(); });
+  $('deny-filter').addEventListener('click', () => { setDenial('filter'); writeUrl(); });
   $('run-all').addEventListener('click', runAll);
 
   $('source-samples').addEventListener('click', async () => {

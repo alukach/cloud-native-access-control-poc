@@ -257,6 +257,14 @@ about how the input gets used?
 
 ## 7. Things worth knowing regardless of which mode you pick
 
+- **Write a column rule about the *column*, not about a region kind.** This
+  repo's own demo preset had `region.kind = 'column_chunk' AND region.column
+  NOT IN (...)`, which under refusal looks nearly right — a page-index read is
+  refused and the matrix shows it — and under a write path withheld
+  **seventeen of nineteen columns**, because a column is withheld if any of its
+  regions is denied and nothing permitted the page indexes. Found by wiring the
+  browser to `rewrite` and reading the number off the page. The same policy,
+  two modes, and only one of them made the mistake visible.
 - **Permit `bloom_filter` and `column_index` for every column you permit.**
   DuckDB parses bloom filters for equality predicates and pyarrow's footer probe
   reaches over them. Withholding one breaks a query with a corruption-shaped

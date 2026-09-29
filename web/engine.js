@@ -255,6 +255,98 @@ export function makeGate({ index, policy, user, url, labels, onRequest }) {
   return state;
 }
 
+/**
+ * The other gate: serve a filtered view instead of refusing reads of it.
+ *
+ * Same seat, same counters, one difference that is the whole point -- this one
+ * never denies. A read is answered from the origin bytes the view needs plus
+ * the resident tail, with the withheld bytes zeroed, and the reader is handed
+ * a valid file whose metadata never mentions what was withheld. So coalescing
+ * stops mattering: there is nothing to straddle, because nothing in the view
+ * points at the hole.
+ *
+ * `straddling` is still counted and is expected to be high. Under refusal that
+ * number is the failure; here it is the evidence: 31 of 33 reads spanning
+ * withheld bytes, all of them served, all of them correct.
+ *
+ * The reader must be told the view's length, not the object's -- a rewritten
+ * Parquet is shorter, and a reader that seeks to the original end lands past
+ * its own footer. `virtualSize` is that number.
+ */
+export function makeFilteredGate({ filtered, url, labels, index, policy, user, onRequest }) {
+  const state = {
+    issued: 0,
+    straddling: 0,
+    denied: 0,
+    bytes: 0,
+    fullBodies: 0,
+    transferred: 0,
+    checkMs: 0,
+    log: [],
+    filtered: true,
+    virtualSize: filtered.virtualSize,
+  };
+
+  state.read = async (start, end) => {
+    const stop = Math.min(end, filtered.virtualSize);
+    state.issued += 1;
+
+    const t0 = performance.now();
+    const [lo, hi] = filtered.originRange(start, stop);
+    // Asked only so the log can say whether this read *would* have been
+    // refused. It never gates anything here, which is the comparison the page
+    // exists to draw: the same range, the same policy, two modes.
+    let wouldRefuse = false;
+    let regions = [];
+    if (hi > lo) {
+      const probe = index.check(policy, user, lo, hi);
+      wouldRefuse = !probe.allowed;
+      regions = Array.from(probe.regions);
+      if (probe.straddles) state.straddling += 1;
+      probe.free();
+    }
+    state.checkMs += performance.now() - t0;
+
+    let origin = new Uint8Array(0);
+    if (hi > lo) {
+      const { bytes, fullBody, transferred } = await fetchRange(url, lo, hi);
+      origin = new Uint8Array(bytes);
+      state.transferred += transferred;
+      if (fullBody) {
+        state.fullBodies += 1;
+      }
+    }
+
+    // The redaction and the tail splice both happen in Rust. Everything this
+    // function knows how to do is fetch.
+    const served = filtered.serve(start, stop, origin);
+    state.bytes += stop - start;
+
+    const entry = {
+      n: state.issued,
+      start,
+      end: stop,
+      length: stop - start,
+      allowed: true,
+      reason: 'served',
+      straddles: wouldRefuse,
+      permitted: regions.length,
+      denied: 0,
+      regions,
+      label: labels(regions),
+      served: true,
+      wouldRefuse,
+      originBytes: hi - lo,
+    };
+    state.log.push(entry);
+    onRequest?.(entry);
+
+    return served.buffer;
+  };
+
+  return state;
+}
+
 // ---- Parquet -------------------------------------------------------------
 
 /**

@@ -124,15 +124,22 @@
           Refuse it
           <span>403, nothing served</span>
         </button>
+        <button type="button" role="radio" id="deny-filter" aria-checked="false">
+          Serve a filtered view
+          <span>rewrite the metadata, zero the withheld bytes</span>
+        </button>
         <button type="button" role="radio" id="deny-zerofill" aria-checked="false" disabled>
           Zero-fill
           <span>serve it, forbidden bytes blanked</span>
         </button>
       </div>
       <p class="preset-note" id="deny-note">
-        Zero-fill is not wired yet. The crate grew the mode while this page was being
-        rebuilt, so it can blank the forbidden bytes inside a range — but no reader here has
-        been run against it, and the page will not print a result it did not measure.
+        <b>Refuse</b> is honest and it cannot serve a client that widens its reads to fixed
+        blocks — which is most of them. <b>Serve a filtered view</b> is what this project
+        recommends: the withheld bytes stay in place but zeroed, and the metadata is rebuilt
+        so nothing points at them. No request is refused, so it stops mattering how a client
+        batches its reads. Zero-fill is not wired yet, and the page will not print a result
+        it did not measure.
       </p>
     </div>
 
@@ -179,6 +186,7 @@
     </div>
     <div class="matrix" id="parquet-matrix"></div>
     <div class="bars" id="parquet-bars"></div>
+    <div class="card filtered" id="parquet-filtered" hidden></div>
     <div class="pair">
       <div class="card">
         <div class="lbl" id="parquet-grid-label">Every column chunk</div>
@@ -205,6 +213,7 @@
       <canvas id="cog-canvas" width="128" height="128"></canvas>
       <div id="cog-preview-note"></div>
     </div>
+    <div class="card filtered" id="cog-filtered" hidden></div>
     <div class="pair">
       <div class="card">
         <div class="lbl" id="cog-grid-label">Every tile</div>
