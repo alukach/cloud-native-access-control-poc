@@ -19,6 +19,7 @@ Parquet, COG, Zarr and Icechunk — enforced at an S3 gateway, using
 > and a browser demo. Not production software; it exists to decide whether
 > [multistore](https://github.com/developmentseed/multistore) should adopt the
 > approach. Background:
+> [integration contract](docs/multistore-integration.md),
 > [design](docs/plans/2026-09-10-cloud-native-access-control-design.md),
 > [plan](docs/plans/2026-09-10-cloud-native-access-control-plan.md),
 > and [27 issues](https://github.com/alukach/cloud-native-access-control-poc/issues)

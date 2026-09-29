@@ -212,6 +212,14 @@ rewritten too.
   Every reader measured seeks by footer offset and never looks at them. One that
   scans sequentially would see a plausible empty structure rather than
   corruption. This is not a defragmented file.
+- **The gateway side is contracted, not built.** [The integration
+  contract](multistore-integration.md) reads multistore's actual request path
+  and reaches one architectural conclusion: `HandlerAction` has three variants
+  and none of them can transform a streaming response body, so `refuse`
+  integrates as a middleware today and every mode that *serves* something needs
+  a new seam in multistore. It also found that multistore forwards the client's
+  `Range` header verbatim (`proxy.rs:916`) — harmless while it makes no
+  sub-object decision, and the §14.2 bypass on the day it does.
 - **Breadth.** One Parquet file, one codec, one flat schema; one COG. Untested:
   nested and repeated types, v2 data pages, encrypted files, hive datasets,
   BigTIFF, and every engine other than the five measured.
