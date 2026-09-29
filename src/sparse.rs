@@ -195,6 +195,23 @@ pub enum SparseError {
     /// An offset computation overflowed a u64. The file disagrees with itself.
     #[error("tile addressing at level {overview_level} overflows a u64")]
     Overflow { overview_level: u32 },
+    /// The policy denies a metadata region this mode must serve regardless.
+    ///
+    /// The header, the IFDs, the tile arrays and the GeoKeys are the structure
+    /// a reader finds the permitted tiles through; a representation withholding
+    /// them would not be a TIFF. So a rule denying them cannot be honoured
+    /// here — and ignoring it means serving bytes the policy denied, which is
+    /// **widening access**, silently.
+    ///
+    /// Refused rather than ignored, because the same YAML under
+    /// [`check`](crate::decision::check) refuses the request outright. See
+    /// [`RewriteError::PolicyDeniesStructure`](crate::rewrite::RewriteError::PolicyDeniesStructure)
+    /// — the Parquet side of the same divergence, issue #27.
+    #[error("the policy denies structure this mode must serve: {}", .regions.join(", "))]
+    PolicyDeniesStructure {
+        /// The `name` of each denied `Metadata` region, sorted.
+        regions: Vec<String>,
+    },
 }
 
 /// One tile the policy withheld.
@@ -396,6 +413,24 @@ pub fn plan(
     let mut scrub: Vec<Range<u64>> = Vec::new();
     let mut withheld: Vec<WithheldTile> = Vec::new();
 
+    // Structure first, over the whole index, so every offending rule is
+    // reported at once. `Unmapped` is already refused above, so every
+    // non-tile region here is `Metadata` and carries a name.
+    let mut denied_structure: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for region in index.regions() {
+        if let RegionKind::Metadata { name } = &region.kind {
+            if !policy.permits(&serde_json::json!({"user": user, "region": region.props()})) {
+                denied_structure.insert(name.clone());
+            }
+        }
+    }
+    if !denied_structure.is_empty() {
+        return Err(SparseError::PolicyDeniesStructure {
+            regions: denied_structure.into_iter().collect(),
+        });
+    }
+
     for region in index.regions() {
         let RegionKind::Tile {
             overview_level,
@@ -591,6 +626,42 @@ mod tests {
             .redact(&mut out)
             .expect("the whole object is served");
         out
+    }
+
+    // The COG side of issue #27, and the same divergence `rewrite` had. A
+    // policy denying the header or the tile arrays refuses the request under
+    // `check`; this mode must serve them, and it used to do so by skipping
+    // every non-tile region -- so the same YAML denied a range and served the
+    // same bytes, silently. `tile_offsets` most of all: it is the array this
+    // module edits, and a reader that cannot read it cannot find any tile.
+    #[test]
+    fn a_policy_denying_the_tiff_structure_is_refused_rather_than_served_anyway() {
+        let (_, index, layout) = parse("data/s2-tci-512.tif");
+        // Every tile at every level, and no structure at all.
+        let policy = policy(&["region.kind = 'tile'"]);
+        let result = plan(&index, &layout, &policy, &user());
+        let Err(SparseError::PolicyDeniesStructure { regions }) = result else {
+            panic!("{result:?}");
+        };
+        for expected in ["header", "ifd", "tile_offsets", "tile_byte_counts"] {
+            assert!(
+                regions.contains(&expected.to_string()),
+                "{regions:?} does not name {expected}"
+            );
+        }
+
+        // And the two modes now agree: `check` refuses a header read under the
+        // same policy. Before this, one refused and the other served.
+        let header_region = index
+            .regions()
+            .iter()
+            .find(|r| matches!(&r.kind, RegionKind::Metadata { name } if name == "header"))
+            .expect("a header region");
+        let range = format!("bytes={}-{}", header_region.start, header_region.end() - 1);
+        assert!(matches!(
+            check(&index, &policy, &user(), Some(&range)),
+            Decision::Denied { .. }
+        ));
     }
 
     #[test]

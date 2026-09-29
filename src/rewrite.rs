@@ -213,6 +213,52 @@ pub enum RewriteError {
     /// two disagree and the result would not be readable.
     #[error("row group {0} would have no columns left")]
     EmptyRowGroup(usize),
+    /// The policy denies a region this mode must serve regardless.
+    ///
+    /// The footer, the magic, the trailer and the inter-chunk padding are the
+    /// structure the permitted columns are found through; a representation
+    /// withholding them would not be a Parquet file. So a rule denying them
+    /// cannot be honoured here — and honouring it partially would mean serving
+    /// bytes the policy denied, which is **widening access**, silently, in the
+    /// one direction that is never acceptable.
+    ///
+    /// Refused rather than reported, because the same YAML under
+    /// [`check`](crate::decision::check) refuses the request outright. Two
+    /// modes disagreeing about whether a principal may read the footer is a
+    /// policy that has not decided what it means. Deny the principal the
+    /// object, or permit the structure explicitly:
+    /// `region.kind = 'metadata' OR region.kind = 'unmapped'`.
+    #[error("the policy denies structure this mode must serve: {}", .regions.join(", "))]
+    PolicyDeniesStructure {
+        /// The `name` of each denied `Metadata` region, and `"unmapped"` for an
+        /// `Unmapped` one. Sorted and deduplicated.
+        regions: Vec<String>,
+    },
+    /// The policy permits a column in some row groups and denies it in others.
+    ///
+    /// A footer can drop a column or keep it. It cannot drop one row group's
+    /// chunk of a column without leaving the row groups ragged, so the honest
+    /// answers are "withhold it everywhere" or "refuse". Withholding everywhere
+    /// is fail-closed and was the previous behaviour; it is still wrong, because
+    /// the policy said something this mode cannot say and nothing reported the
+    /// difference. A rule that reads `row_group = 3 AND column = 'x'` withheld
+    /// all eight row groups and looked like it had worked.
+    ///
+    /// Issue [#27].
+    ///
+    /// [#27]: https://github.com/alukach/cloud-native-access-control-poc/issues/27
+    #[error(
+        "the policy denies `{column}` in row groups {denied:?} but permits it in {permitted:?}; \
+         a rewritten footer cannot express that"
+    )]
+    PolicyNotRepresentable {
+        /// The full dotted `path_in_schema`.
+        column: String,
+        /// Row groups whose chunk of this column the policy permitted.
+        permitted: Vec<usize>,
+        /// Row groups whose chunk of this column the policy denied.
+        denied: Vec<usize>,
+    },
 }
 
 /// One column the policy withheld, and why.
@@ -420,17 +466,26 @@ impl Rewrite {
 /// leaving the row groups ragged, and it cannot keep a column while dropping
 /// its bloom filter without lying about where that bloom filter is.
 ///
-/// # What is NOT evaluated
+/// # Policies this mode refuses rather than approximates
 ///
-/// Regions with no column -- `Metadata` and `Unmapped` -- are not policy inputs
-/// here, and this is the one place this module's semantics diverge from
-/// [`check`](crate::decision::check). Under refusal those regions gate a
-/// *range*, so a policy denying the footer refuses the request. Under rewrite
-/// there is no range to gate: the footer, the magic and the inter-chunk padding
-/// are the structure the permitted columns are found through, and a
-/// representation withholding them would not be a Parquet file at all. A
-/// deployment that wants to deny a principal the object denies it the object,
-/// rather than expressing that as a region rule.
+/// Regions with no column -- `Metadata` and `Unmapped` -- cannot be withheld: a
+/// representation without its own footer is not a Parquet file. That is a real
+/// constraint, and it used to be met by *ignoring* those regions, which meant a
+/// policy denying the footer refused the request under
+/// [`check`](crate::decision::check) and served it here, with nothing saying so.
+/// Serving bytes the policy denied is widening access, and doing it silently is
+/// the worst available option. Such a policy is now
+/// [`RewriteError::PolicyDeniesStructure`].
+///
+/// The same applies to a denial this mode can only over-honour: a column
+/// permitted in some row groups and denied in others is
+/// [`RewriteError::PolicyNotRepresentable`], because a footer cannot leave the
+/// row groups ragged. Withholding the column everywhere is fail-closed, but it
+/// is not what the policy said.
+///
+/// Both are refusals, not warnings, and both are checked before any byte is
+/// planned. A policy that cannot be expressed in this mode should fail where it
+/// is deployed, not serve an approximation of itself.
 pub fn plan(
     index: &LayoutIndex,
     footer_body: &[u8],
@@ -453,12 +508,48 @@ pub fn plan(
     // Which columns lose which kinds. Ordered maps so the report and the ETag
     // derived from it are stable across runs.
     let mut denied: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    // The two shapes a policy can take that this mode cannot honour. Collected
+    // over the whole index and reported together, so an author sees every
+    // offending rule at once rather than fixing them one call at a time.
+    let mut denied_structure: BTreeSet<String> = BTreeSet::new();
+    let mut split: BTreeMap<&str, (BTreeSet<usize>, BTreeSet<usize>)> = BTreeMap::new();
+
     for region in index.regions() {
+        let props = region.props();
+        let permitted = policy.permits(&json!({"user": user, "region": props}));
+
         let Some(column) = region.column() else {
+            if !permitted {
+                // `Metadata` carries a name worth reporting. Anything else
+                // is named by its `kind`, read off the props already built
+                // rather than re-matched here: `props()` is the one place
+                // every kind is spelled, and a new variant added there needs
+                // no change here.
+                denied_structure.insert(match &region.kind {
+                    RegionKind::Metadata { name } => name.clone(),
+                    _ => props
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                });
+            }
             continue;
         };
-        let props = region.props();
-        if policy.permits(&json!({"user": user, "region": props})) {
+
+        // Row-group scope is tracked for chunks only. A `column_index` or
+        // `bloom_filter` region is per column, not per row group, so it cannot
+        // disagree with itself across groups.
+        if let RegionKind::ColumnChunk { row_group, .. } = &region.kind {
+            let entry = split.entry(column).or_default();
+            if permitted {
+                entry.0.insert(*row_group);
+            } else {
+                entry.1.insert(*row_group);
+            }
+        }
+
+        if permitted {
             continue;
         }
         let kind = props
@@ -467,6 +558,21 @@ pub fn plan(
             .unwrap_or("unknown")
             .to_string();
         denied.entry(column).or_default().insert(kind);
+    }
+
+    if !denied_structure.is_empty() {
+        return Err(RewriteError::PolicyDeniesStructure {
+            regions: denied_structure.into_iter().collect(),
+        });
+    }
+    for (column, (permitted, denied_groups)) in &split {
+        if !permitted.is_empty() && !denied_groups.is_empty() {
+            return Err(RewriteError::PolicyNotRepresentable {
+                column: (*column).to_string(),
+                permitted: permitted.iter().copied().collect(),
+                denied: denied_groups.iter().copied().collect(),
+            });
+        }
     }
 
     // Every region of every withheld column is scrubbed, including the ones the
@@ -1477,9 +1583,147 @@ mod tests {
         Policy::load(&yaml, QUERYABLES).expect("policy")
     }
 
+    /// One `allow:` document from one rule per line.
+    ///
+    /// Built rather than written inline because a Rust line continuation
+    /// inside a YAML string carries the indentation with it, and the parse
+    /// error that produces says nothing about the rule under test.
+    fn policy_from(rules: &[&str]) -> Policy {
+        let mut yaml = String::from("allow:\n");
+        for rule in rules {
+            yaml.push_str(&format!("  - \"{rule}\"\n"));
+        }
+        Policy::load(&yaml, QUERYABLES).expect("policy")
+    }
+
     /// Permit everything, so a rewrite withholds nothing.
     fn permit_all() -> Policy {
         Policy::load("allow:\n  - \"1 = 1\"\n", QUERYABLES).expect("policy")
+    }
+
+    // ---- issue #27: policies this mode refuses --------------------------
+
+    // The divergence that was silent. Under `check` a policy denying the
+    // footer refuses the request; this mode must serve the footer, and it used
+    // to do so by ignoring those regions entirely -- so the same YAML denied a
+    // range and served the same bytes, with nothing reporting the difference.
+    // Serving bytes the policy denied is widening access. Refuse instead.
+    #[test]
+    fn a_policy_denying_the_footer_is_refused_rather_than_served_anyway() {
+        let sample = Sample::load(NYC);
+        // Permits every column-attributed region and nothing else, so this
+        // is a structure-only denial. Spelled by kind rather than
+        // `region.column IS NOT NULL`, which `Policy::load` bans outright:
+        // `isNull` folds an absent property to true, which is how a typo
+        // fails open.
+        let policy = policy_from(&[
+            "region.kind IN ('column_chunk', 'column_index', 'bloom_filter', 'column_metadata')",
+        ]);
+        let result = plan(
+            &sample.index,
+            sample.footer_body(),
+            &policy,
+            &json!({"role": "analyst"}),
+        );
+        let Err(RewriteError::PolicyDeniesStructure { regions }) = result else {
+            panic!("{result:?}");
+        };
+        // Every structural region of this file, named. `magic` and
+        // `footer_trailer` are here too: the policy denied them as surely as it
+        // denied the footer, and an author fixing one rule should see all of it.
+        assert!(
+            regions.contains(&"footer".to_string()),
+            "{regions:?} does not name the footer"
+        );
+
+        // The same policy under `check` refuses a footer read. That agreement
+        // is the point -- before this, the two modes disagreed.
+        let footer = sample.footer_region();
+        let header = format!("bytes={}-{}", footer.start, footer.end() - 1);
+        assert!(matches!(
+            crate::decision::check(
+                &sample.index,
+                &policy,
+                &json!({"role": "analyst"}),
+                Some(&header)
+            ),
+            crate::decision::Decision::Denied { .. }
+        ));
+    }
+
+    // The other half of #27, and the one that reads as working. A footer can
+    // drop a column or keep it; it cannot drop one row group's chunk without
+    // leaving the row groups ragged. The old behaviour withheld all eight --
+    // fail-closed, and not what the policy said, and nothing in the report
+    // distinguished it from a whole-column denial.
+    #[test]
+    fn a_row_group_scoped_denial_is_refused_rather_than_widened_to_the_column() {
+        let sample = Sample::load(NYC);
+        let policy = policy_from(&[
+            "region.kind = 'metadata'",
+            "NOT (region.column = 'fare_amount' AND region.row_group = 3)",
+        ]);
+        let result = plan(
+            &sample.index,
+            sample.footer_body(),
+            &policy,
+            &json!({"role": "analyst"}),
+        );
+        let Err(RewriteError::PolicyNotRepresentable {
+            column,
+            permitted,
+            denied,
+        }) = result
+        else {
+            panic!("{result:?}");
+        };
+        assert_eq!(column, "fare_amount");
+        assert_eq!(denied, vec![3]);
+        // Seven groups permitted, one denied -- the shape that used to withhold
+        // all eight and call it fail-closed.
+        assert_eq!(permitted, vec![0, 1, 2, 4, 5, 6, 7]);
+    }
+
+    // The neighbouring case that must still work, or the check above is a
+    // regression rather than a fix: a column denied in EVERY row group is
+    // exactly representable, and is the ordinary way to withhold one.
+    #[test]
+    fn a_denial_covering_every_row_group_is_still_representable() {
+        let sample = Sample::load(NYC);
+        let rewrite = sample.plan(&["fare_amount"]);
+        assert_eq!(
+            rewrite
+                .withheld()
+                .iter()
+                .map(|w| w.column.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fare_amount"]
+        );
+    }
+
+    // A column-level denial reported for `bloom_filter` alone is not a
+    // row-group split: a bloom filter is per column, not per row group, so
+    // there is nothing for it to disagree with. This is the fail-closed
+    // widening #26 measured, and it must survive -- the #27 check must not
+    // start refusing it.
+    #[test]
+    fn withholding_only_a_bloom_filter_still_withholds_the_column() {
+        let sample = Sample::load(NYC);
+        let policy = policy_from(&[
+            "region.kind = 'metadata'",
+            "NOT (region.column = 'fare_amount' AND region.kind = 'bloom_filter')",
+        ]);
+        let rewrite = plan(
+            &sample.index,
+            sample.footer_body(),
+            &policy,
+            &json!({"role": "analyst"}),
+        )
+        .expect("a bloom-filter-only denial is representable");
+        let withheld = rewrite.withheld();
+        assert_eq!(withheld.len(), 1);
+        assert_eq!(withheld[0].column, "fare_amount");
+        assert_eq!(withheld[0].denied_kinds, vec!["bloom_filter".to_string()]);
     }
 
     // ---- the codec ------------------------------------------------------

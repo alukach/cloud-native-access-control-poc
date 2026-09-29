@@ -15,7 +15,7 @@ Parquet, COG, Zarr and Icechunk — enforced at an S3 gateway, using
 > scrubbed — works for every client measured, because its correctness does not
 > depend on how a client batches reads.
 >
-> 225 tests, two runnable gateways (`examples/gate.rs`, `examples/cog_gate.rs`),
+> 230 tests, two runnable gateways (`examples/gate.rs`, `examples/cog_gate.rs`),
 > and a browser demo. Not production software; it exists to decide whether
 > [multistore](https://github.com/developmentseed/multistore) should adopt the
 > approach. Background:
@@ -296,7 +296,7 @@ and `rustup` installs it automatically). For the browser demo you also need
 ### The crate
 
 ```sh
-cargo test          # 225 tests; the test names are the specification
+cargo test          # 230 tests; the test names are the specification
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -321,6 +321,7 @@ Worth reading by name, since each pins a bug that would otherwise have shipped:
 | `withholding_a_groups_only_leaf_prunes_the_group_rather_than_emptying_it` | `num_children=0` silently reshapes the schema |
 | `s_intersects_grants_tiles_outside_the_area_and_s_contains_does_not` | 49 tiles served where 25 were licensed |
 | `a_200_with_the_whole_object_is_refused_not_relayed` | the RFC 9110 §14.2 full-object disclosure |
+| `a_policy_denying_the_footer_is_refused_rather_than_served_anyway` | a mode serving bytes the policy denied |
 
 ### The gateway
 

@@ -203,11 +203,17 @@ rewritten too.
   script in this repository: the suite tests the resolver against *writers* we
   did not write, not against *files* we did not make. Closing that needs CI
   indexing a pinned remote URL.
-- **[#27](../../issues/27) — one policy, two meanings.** `check()` gates a
-  range, so metadata regions participate; `plan()` produces a representation and
-  must serve the footer unconditionally. The same rule is load-bearing in one
-  mode and dead in the other, and a row-group-scoped denial silently widens to
-  the whole column.
+- **[#27](../../issues/27) — one policy, two meanings — is closed, and the
+  fix was to refuse.** `check()` gates a range, so metadata regions
+  participate; `plan()` produces a representation and must serve the footer.
+  The old behaviour met that by *ignoring* structure regions, so a policy
+  denying the footer refused a range and served the same bytes, silently. That
+  direction matters: serving bytes the policy denied is widening access, and it
+  is the one error that is never acceptable. Both `plan()`s now refuse such a
+  policy (`PolicyDeniesStructure`), as does a row-group-scoped column denial
+  that a footer can only over-honour (`PolicyNotRepresentable`). A policy that
+  cannot be expressed in a mode fails where it is deployed rather than serving
+  an approximation of itself.
 - **[#28](../../issues/28) — scrubbed bytes are a valid-looking Thrift STOP.**
   Every reader measured seeks by footer offset and never looks at them. One that
   scans sequentially would see a plausible empty structure rather than
@@ -284,7 +290,7 @@ about how the input gets used?
 ## 8. Reproducing this
 
 ```sh
-cargo test                                    # 225 tests
+cargo test                                    # 230 tests
 cargo run --example gate -- --help            # the rewrite+scrub gateway
 ./scripts/make-fixtures.sh verify             # re-measure the sample files
 ```
