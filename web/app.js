@@ -471,7 +471,8 @@ function renderReaders() {
     sql: 'The engine reads the file over HTTP. It is not told about the policy — whatever '
       + 'it can see is what the gate served it.',
     deck: 'Pan and zoom the image. Every tile on screen is its own range request through '
-      + 'the gate; a withheld tile comes back black.',
+      + 'the gate. A withheld tile is hatched — geotiff.js cannot decode a tile the gate '
+      + 'withheld, where GDAL reads the same bytes as nodata.',
     map: 'The reader decodes one whole level. Whatever renders is what the gate served.',
   }[reader?.ui] || '';
 
@@ -564,7 +565,7 @@ async function runQuery() {
       renderJumps();
       diag.className = 'diag ok';
       diag.textContent = 'The map is reading through the gate. Pan and zoom — every tile '
-        + 'on screen is a range request, and a withheld one comes back black.';
+        + 'on screen is a range request, and a withheld one is hatched.';
       return;
     }
     const result = await reader.run({

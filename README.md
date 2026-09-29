@@ -12,8 +12,13 @@ Parquet, COG, Zarr and Icechunk — enforced at an S3 gateway, using
 > it works only for clients that read exact chunk extents, and GDAL `/vsicurl`
 > cannot be configured into that shape. Serving a rewritten view instead —
 > `rewrite` for Parquet, `sparsify` for COG, both with the withheld bytes
-> scrubbed — works for every client measured, because its correctness does not
-> depend on how a client batches reads.
+> scrubbed — removes the dependence on how a client batches reads.
+>
+> For Parquet that is the whole answer: every client measured reads a rewritten
+> file, because nothing in it points at the hole. For COG it is most of the
+> answer with one measured exception — GDAL reads a sparsified file natively and
+> **geotiff.js cannot read one at all**, because it dereferences the zeroed tile
+> entry instead of treating it as a tile that was never written.
 >
 > 235 tests, two runnable gateways (`examples/gate.rs`, `examples/cog_gate.rs`),
 > and a browser demo. Not production software; it exists to decide whether

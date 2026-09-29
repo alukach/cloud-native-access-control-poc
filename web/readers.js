@@ -89,7 +89,9 @@ export const READERS = [
     note: 'Pan and zoom. Every tile on screen is a separate range request through the '
       + 'gate, at whatever overview level the zoom calls for — so a policy that '
       + 'withholds a location has to withhold it at every level, and you can see '
-      + 'immediately when it does not.',
+      + 'immediately when it does not. The occlusion is always whole tiles, rounded '
+      + 'outward, and each level has its own grid at twice the ground size: its shape '
+      + 'changes with the zoom because it shows the tile grid, not what was hidden.',
     async mount(container, options) {
       const { mountMap } = await import('./map.js');
       return mountMap(container, options);

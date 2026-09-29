@@ -54,9 +54,12 @@ export async function mountMap(container, { url, onStatus }) {
   let width = 0;
   let height = 0;
   let generation = 0;
+  /** How many tiles this reader refused to decode, for the status line. */
+  let undecodable = 0;
 
   async function openTiff(nextUrl) {
     onStatus?.('reading the image…');
+    undecodable = 0;
     tiff = await fromUrl(nextUrl);
     const count = await tiff.getImageCount();
     images = [];
@@ -68,6 +71,30 @@ export async function mountMap(container, { url, onStatus }) {
   }
 
   await openTiff(url);
+
+  /**
+   * What a withheld tile looks like.
+   *
+   * Deliberately not a plain black rectangle. Black is what GDAL produces from
+   * these same bytes, and drawing it here would claim this reader had decoded
+   * something it could not. The hatch says "nothing was served for this tile",
+   * which is the true statement for every reader.
+   */
+  function withheldTile(w, h) {
+    const data = new Uint8ClampedArray(w * h * 4);
+    for (let y = 0; y < h; y += 1) {
+      for (let x = 0; x < w; x += 1) {
+        const p = (y * w + x) * 4;
+        const stripe = ((x + y) % 14) < 7;
+        const v = stripe ? 26 : 38;
+        data[p] = v;
+        data[p + 1] = v;
+        data[p + 2] = v;
+        data[p + 3] = 255;
+      }
+    }
+    return new ImageData(data, w, h);
+  }
 
   /**
    * Read one screen tile.
@@ -113,7 +140,27 @@ export async function mountMap(container, { url, onStatus }) {
     const outW = Math.max(1, Math.round(((right - left) / (bbox.right - bbox.left)) * 256));
     const outH = Math.max(1, Math.round(((bottom - top) / (bbox.bottom - bbox.top)) * 256));
 
-    const rgb = await image.readRGB({ window, width: outW, height: outH, signal });
+    let rgb;
+    try {
+      rgb = await image.readRGB({ window, width: outW, height: outH, signal });
+    } catch (err) {
+      // geotiff.js cannot read a sparse tile. `TileOffsets[i] == 0` means "never
+      // written" and GDAL fills it with nodata; geotiff.js dereferences the
+      // missing entry and throws `Cannot read properties of undefined (reading
+      // 'offset')`. That is this reader's limit, not a property of the file --
+      // GDAL reads the identical bytes and decodes the withheld tiles as
+      // zeroes -- so the tile is drawn as withheld and the reader's failure is
+      // reported, rather than letting the page background show through and
+      // reading as though the gate had served a grey square.
+      if (mine !== generation) return null;
+      if (!/offset|undefined/i.test(String(err?.message || err))) throw err;
+      undecodable += 1;
+      onStatus?.(
+        `${width}×${height}, ${images.length} levels — ${undecodable} tile`
+        + `${undecodable === 1 ? '' : 's'} withheld, which this reader cannot decode`,
+      );
+      return { image: withheldTile(outW, outH), bounds: [left, bottom, right, top] };
+    }
     if (mine !== generation) return null;
 
     // A withheld tile arrives as zeroes, which is black -- the honest

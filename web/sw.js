@@ -31,8 +31,37 @@
 
 import init, { LayoutIndex, Policy } from './pkg/cnac.js';
 
-/** Configured gates, by id. Lost on worker restart; the page re-sends. */
+/**
+ * Configured gates, by id.
+ *
+ * In memory only, and a service worker is terminated whenever the browser
+ * decides it has been idle -- about thirty seconds of no fetches. Everything
+ * here is derived from the config, so the config is what gets persisted, and a
+ * request for a gate this worker has never heard of rebuilds it from that
+ * rather than failing. Without this the demo works until you stop touching it
+ * and then every tile 503s, which looks exactly like the policy breaking.
+ */
 const gates = new Map();
+
+/** Where the configs outlive the worker. */
+const STORE = 'cnac-gate-configs-v1';
+const configKey = (id) => new Request(`/__cnac_gate_config__/${id}`);
+
+async function rememberConfig(id, config) {
+  const cache = await caches.open(STORE);
+  await cache.put(configKey(id), new Response(JSON.stringify(config)));
+}
+
+async function forgetConfig(id) {
+  const cache = await caches.open(STORE);
+  await cache.delete(configKey(id));
+}
+
+async function recallConfig(id) {
+  const cache = await caches.open(STORE);
+  const stored = await cache.match(configKey(id));
+  return stored ? stored.json() : null;
+}
 
 let wasm = null;
 const ready = () => (wasm ??= init());
@@ -49,6 +78,7 @@ self.addEventListener('message', (event) => {
   } else if (type === 'release') {
     dispose(gates.get(id));
     gates.delete(id);
+    event.waitUntil(forgetConfig(id));
   } else if (type === 'ping') {
     event.source?.postMessage({ type: 'pong', ready: true });
   }
@@ -70,43 +100,63 @@ function dispose(gate) {
  */
 async function configure(event) {
   const { id, url, format, policy, user, mode } = event.data;
+  const config = { url, format, policy, user, mode };
   await ready();
   dispose(gates.get(id));
 
   const reply = (message) => event.source?.postMessage({ id, ...message });
   try {
-    const size = await objectSize(url);
-    const { index, window } = await buildIndex(format, url, size);
-    const loaded = new Policy(policy);
-
-    let filtered = null;
-    let planError = null;
-    if (mode === 'filter') {
-      try {
-        filtered = index.plan(loaded, user);
-      } catch (err) {
-        // Issue #27: a policy this mode cannot express. Not a failure to hide
-        // -- it is the most instructive thing the gate can say.
-        planError = err?.message || String(err);
-      }
-    }
-
-    gates.set(id, { url, format, size, index, policy: loaded, user, mode, filtered });
+    const gate = await build(config);
+    gates.set(id, gate);
+    await rememberConfig(id, config);
     reply({
       type: 'configured',
-      size,
-      window,
-      regionCount: index.regionCount,
-      regions: index.regions(),
-      virtualSize: filtered ? filtered.virtualSize : size,
-      withheld: filtered ? filtered.withheld : null,
-      scrub: filtered ? Array.from(filtered.scrub) : [],
-      etag: filtered ? filtered.etag : null,
-      planError,
+      size: gate.size,
+      window: gate.window,
+      regionCount: gate.index.regionCount,
+      regions: gate.index.regions(),
+      virtualSize: gate.filtered ? gate.filtered.virtualSize : gate.size,
+      withheld: gate.filtered ? gate.filtered.withheld : null,
+      scrub: gate.filtered ? Array.from(gate.filtered.scrub) : [],
+      etag: gate.filtered ? gate.filtered.etag : null,
+      planError: gate.planError,
     });
   } catch (err) {
     reply({ type: 'failed', message: err?.message || String(err) });
   }
+}
+
+/** Everything a gate needs, from nothing but its config. */
+async function build(config) {
+  const { url, format, policy, user, mode } = config;
+  await ready();
+  const size = await objectSize(url);
+  const { index, window } = await buildIndex(format, url, size);
+  const loaded = new Policy(policy);
+
+  let filtered = null;
+  let planError = null;
+  if (mode === 'filter') {
+    try {
+      filtered = index.plan(loaded, user);
+    } catch (err) {
+      // Issue #27: a policy this mode cannot express. Not a failure to hide
+      // -- it is the most instructive thing the gate can say.
+      planError = err?.message || String(err);
+    }
+  }
+  return { url, format, size, window, index, policy: loaded, user, mode, filtered, planError };
+}
+
+/** The gate for `id`, rebuilt from its stored config if this worker restarted. */
+async function gateFor(id) {
+  const live = gates.get(id);
+  if (live) return live;
+  const config = await recallConfig(id);
+  if (!config) return null;
+  const rebuilt = await build(config);
+  gates.set(id, rebuilt);
+  return rebuilt;
 }
 
 /**
@@ -120,13 +170,13 @@ async function configure(event) {
  */
 async function resolve(event) {
   const { id, start, end } = event.data;
-  const gate = gates.get(id);
   const reply = (message) => event.source?.postMessage({ id, ...message });
-  if (!gate) {
-    reply({ type: 'failed', message: 'this gate is not configured' });
-    return;
-  }
   try {
+    const gate = await gateFor(id);
+    if (!gate) {
+      reply({ type: 'failed', message: 'this gate is not configured' });
+      return;
+    }
     const result = gate.index.check(gate.policy, gate.user, start, end);
     const payload = {
       type: 'resolved',
@@ -233,7 +283,12 @@ const plain = (status, body, headers = {}) =>
   new Response(body, { status, headers: { 'content-type': 'text/plain', ...headers } });
 
 async function serve(id, request) {
-  const gate = gates.get(id);
+  let gate;
+  try {
+    gate = await gateFor(id);
+  } catch (err) {
+    return plain(502, `The gate could not be rebuilt: ${err?.message || err}`);
+  }
   if (!gate) return plain(503, 'This gate is not configured. Reload the page.');
 
   const filtering = gate.mode === 'filter' && gate.filtered;

@@ -281,6 +281,29 @@ about how the input gets used?
   ones it is sure about.
 - **A CDN can strip ranges entirely.** Found while deploying this repository's
   own demo. Same RFC clause, arriving as an infrastructure problem.
+- **A sparsified COG is not readable by every client. geotiff.js throws on it.**
+  Zeroing `TileOffsets[i]` and `TileByteCounts[i]` is how a COG says a tile was
+  never written, and GDAL reads it as nodata — verified on the served bytes,
+  which it decodes without complaint. geotiff.js instead dereferences the
+  missing entry and throws `Cannot read properties of undefined (reading
+  'offset')`, so it cannot read the object at all past the first withheld tile.
+  This corrects an earlier claim in this document that `sparsify` "works for
+  every client measured": it was measured against GDAL and against geotiff.js
+  reading an *unmodified* file, never against geotiff.js reading a sparsified
+  one. Sparse tiles are a legal and long-standing part of the format, so this is
+  a gap in that reader rather than a defect in the representation — but the
+  practical consequence is the same, and it is the mirror of the Parquet
+  result: **rewrite removes the dependence on client behaviour, sparsify does
+  not remove it entirely.**
+- **The occlusion is tile-shaped, and its shape changes with the zoom.** A tile
+  is the unit of service, so a withheld area is always rounded outward to whole
+  tiles — and each overview level has its own grid, at twice the ground size of
+  the one below. On `data/paris-landmarks.tif` the same 260 × 250 m box around
+  the Arc de Triomphe withholds 3 × 2 tiles at level 0 (459 × 306 m), 2 × 1 at
+  level 1 (611 × 306 m), and 1 × 1 at levels 2 through 4. A viewer therefore
+  shows a wide rectangle at one zoom and a square at the next, for one
+  unchanging rule. Nothing is wrong when that happens; it is what tile-granular
+  enforcement looks like, and a demo that hid it would be lying about the grain.
 - **Write a spatial rule as `S_CONTAINS(<area>, region.geom)`, never
   `S_INTERSECTS(region.geom, <area>)`.** A tile is the unit of service, so an
   existential predicate grants every tile the area touches — 49 tiles where 25
