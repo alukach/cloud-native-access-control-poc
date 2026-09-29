@@ -15,7 +15,7 @@ Parquet, COG, Zarr and Icechunk — enforced at an S3 gateway, using
 > scrubbed — works for every client measured, because its correctness does not
 > depend on how a client batches reads.
 >
-> 230 tests, two runnable gateways (`examples/gate.rs`, `examples/cog_gate.rs`),
+> 235 tests, two runnable gateways (`examples/gate.rs`, `examples/cog_gate.rs`),
 > and a browser demo. Not production software; it exists to decide whether
 > [multistore](https://github.com/developmentseed/multistore) should adopt the
 > approach. Background:
@@ -296,7 +296,7 @@ and `rustup` installs it automatically). For the browser demo you also need
 ### The crate
 
 ```sh
-cargo test          # 230 tests; the test names are the specification
+cargo test          # 235 tests; the test names are the specification
 cargo clippy --all-targets -- -D warnings
 ```
 

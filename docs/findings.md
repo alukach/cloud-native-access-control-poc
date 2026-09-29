@@ -290,7 +290,7 @@ about how the input gets used?
 ## 8. Reproducing this
 
 ```sh
-cargo test                                    # 230 tests
+cargo test                                    # 235 tests
 cargo run --example gate -- --help            # the rewrite+scrub gateway
 ./scripts/make-fixtures.sh verify             # re-measure the sample files
 ```

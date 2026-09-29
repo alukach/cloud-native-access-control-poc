@@ -50,13 +50,16 @@
 //! crossing unchanged or does not cross.
 
 use crate::{
-    cog,
+    cog::{self, CogLayout},
     decision::{self, Decision, DenialMode, DenyReason, RedactError, Verdict},
-    index::LayoutIndex,
+    index::{LayoutIndex, RegionKind},
     parquet,
     policy::{Policy, QUERYABLES},
+    rewrite::{self, Rewrite},
+    sparse::{self, Sparse},
 };
 use serde_json::{json, Value};
+use std::ops::Range;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -263,22 +266,38 @@ pub fn build_index(
     format: Format,
     bytes: &[u8],
     object_size: u64,
-) -> Result<LayoutIndex, BuildError> {
-    let index = match format {
-        Format::Parquet => parquet::build_index(bytes, object_size).map_err(|e| BuildError {
-            message: e.to_string(),
-            needed: match e {
-                parquet::ParquetError::Truncated { needed } => Some(needed),
-                _ => None,
-            },
-        })?,
-        Format::Cog => cog::build_index(bytes, object_size).map_err(|e| BuildError {
-            message: e.to_string(),
-            needed: match e {
-                cog::CogError::Truncated { needed } => Some(needed),
-                _ => None,
-            },
-        })?,
+) -> Result<(LayoutIndex, Filterable), BuildError> {
+    let (index, filterable) = match format {
+        Format::Parquet => {
+            let index = parquet::build_index(bytes, object_size).map_err(|e| BuildError {
+                message: e.to_string(),
+                needed: match e {
+                    parquet::ParquetError::Truncated { needed } => Some(needed),
+                    _ => None,
+                },
+            })?;
+            // The footer thrift, copied out of the window while the window
+            // still exists. `rewrite::plan` takes it verbatim and the browser
+            // keeps only the index, so this is the last moment it is available.
+            let footer_body = footer_body(&index, bytes, object_size)?;
+            (index, Filterable::Parquet { footer_body })
+        }
+        Format::Cog => {
+            let (index, layout) =
+                cog::build_index_with_layout(bytes, object_size).map_err(|e| BuildError {
+                    message: e.to_string(),
+                    needed: match e {
+                        cog::CogError::Truncated { needed } => Some(needed),
+                        _ => None,
+                    },
+                })?;
+            (
+                index,
+                Filterable::Cog {
+                    layout: Box::new(layout),
+                },
+            )
+        }
     };
     // Region indices cross to JS as `u32`. Unreachable for any real object --
     // it would need four billion regions -- but the alternative to checking is
@@ -289,7 +308,36 @@ pub fn build_index(
             "object has more regions than a u32 can index",
         ));
     }
-    Ok(index)
+    Ok((index, filterable))
+}
+
+/// Copy the footer region's bytes out of a tail window.
+///
+/// The window is the *end* of the object, so a region's absolute offset is an
+/// index into it only after subtracting where the window starts. Getting that
+/// subtraction wrong yields a footer body of the right length taken from the
+/// wrong place, which `rewrite::plan` would reject as
+/// `CodecNotFaithful` -- a confusing error a long way from its cause, so it is
+/// checked here instead.
+fn footer_body(index: &LayoutIndex, bytes: &[u8], object_size: u64) -> Result<Vec<u8>, BuildError> {
+    let footer = index
+        .regions()
+        .iter()
+        .find(|r| matches!(&r.kind, RegionKind::Metadata { name } if name == "footer"))
+        .ok_or_else(|| BuildError::msg("the index does not describe a Parquet footer"))?;
+    let window_start = object_size
+        .checked_sub(bytes.len() as u64)
+        .ok_or_else(|| BuildError::msg("window is longer than the object"))?;
+    let lo = footer
+        .start
+        .checked_sub(window_start)
+        .ok_or_else(|| BuildError::msg("the footer starts before the window"))?
+        as usize;
+    let hi = lo + footer.len as usize;
+    bytes
+        .get(lo..hi)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| BuildError::msg("the footer extends past the window"))
 }
 
 /// Every region, in order, as the JSON the demo builds its grids from.
@@ -567,6 +615,7 @@ impl WasmPolicy {
 #[wasm_bindgen(js_name = LayoutIndex)]
 pub struct WasmIndex {
     inner: LayoutIndex,
+    filterable: Filterable,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -583,7 +632,7 @@ impl WasmIndex {
             Format::parse(format).ok_or_else(|| js_error(&format!("unknown format `{format}`")))?;
         let object_size = offset_from_f64(object_size).map_err(|e| js_error(&e))?;
         build_index(format, bytes, object_size)
-            .map(|inner| WasmIndex { inner })
+            .map(|(inner, filterable)| WasmIndex { inner, filterable })
             .map_err(build_error_to_js)
     }
 
@@ -659,6 +708,96 @@ impl WasmIndex {
                 mode,
             ),
         })
+    }
+
+    /// Plan the filtered view this policy implies: `rewrite` for Parquet,
+    /// `sparsify` for a COG.
+    ///
+    /// Throws when the policy cannot be expressed in this mode -- see issue
+    /// #27. That throw is a result and not a failure: it is the only way a
+    /// page can show *why* a rule that works under refusal cannot be honoured
+    /// by a write path, and the message names every offending region.
+    pub fn plan(&self, policy: &WasmPolicy, user: &str) -> Result<WasmFiltered, JsValue> {
+        let user = parse_user(user).map_err(|e| js_error(&e))?;
+        plan_filtered(&self.inner, &self.filterable, &policy.inner, &user)
+            .map(|inner| WasmFiltered { inner })
+            .map_err(|e| js_error(&e))
+    }
+}
+
+/// A planned filtered view of an object.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(js_name = Filtered)]
+pub struct WasmFiltered {
+    inner: Filtered,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(js_class = Filtered)]
+impl WasmFiltered {
+    /// The length a client sees. Smaller than the object for a rewritten
+    /// Parquet; equal to it for a sparsified COG, which preserves every offset.
+    #[wasm_bindgen(getter, js_name = virtualSize)]
+    pub fn virtual_size(&self) -> f64 {
+        self.inner.virtual_size() as f64
+    }
+
+    /// The length of the object in storage.
+    #[wasm_bindgen(getter, js_name = originalSize)]
+    pub fn original_size(&self) -> f64 {
+        self.inner.original_size() as f64
+    }
+
+    /// The offset at and above which bytes are resident rather than fetched.
+    #[wasm_bindgen(getter, js_name = tailStart)]
+    pub fn tail_start(&self) -> f64 {
+        self.inner.tail_start() as f64
+    }
+
+    /// A validator for the *view*. Not the object's: a client allowed to
+    /// revalidate this against the origin would be told it is stale and fetch
+    /// the unfiltered object.
+    #[wasm_bindgen(getter)]
+    pub fn etag(&self) -> String {
+        self.inner.etag()
+    }
+
+    /// What was withheld, as JSON. `{kind: "columns", ...}` for Parquet,
+    /// `{kind: "tiles", ...}` for a COG.
+    #[wasm_bindgen(getter)]
+    pub fn withheld(&self) -> String {
+        self.inner.withheld_json()
+    }
+
+    /// Every zeroed span of origin bytes, flattened to `[start, end, ...]`.
+    /// For drawing only -- [`WasmFiltered::serve`] applies them itself.
+    #[wasm_bindgen(getter)]
+    pub fn scrub(&self) -> Vec<f64> {
+        self.inner.scrub_pairs()
+    }
+
+    /// The origin bytes needed to serve `[start, end)` of the view, as
+    /// `[lo, hi]`. `lo == hi` means fetch nothing: the range is resident.
+    #[wasm_bindgen(js_name = originRange)]
+    pub fn origin_range(&self, start: f64, end: f64) -> Result<Vec<f64>, JsValue> {
+        let start = offset_from_f64(start).map_err(|e| js_error(&e))?;
+        let end = offset_from_f64(end).map_err(|e| js_error(&e))?;
+        let range = origin_range(&self.inner, &(start..end));
+        Ok(vec![range.start as f64, range.end as f64])
+    }
+
+    /// Assemble `[start, end)` of the view. `origin` must be exactly the bytes
+    /// [`WasmFiltered::origin_range`] named, and an empty array when it named
+    /// nothing.
+    ///
+    /// The redaction happens here rather than in JS on purpose: a caller
+    /// handed the scrub spans and asked to zero them itself would be a second
+    /// implementation of the arithmetic, and the second implementation is the
+    /// one nobody audits.
+    pub fn serve(&self, start: f64, end: f64, origin: &[u8]) -> Result<Vec<u8>, JsValue> {
+        let start = offset_from_f64(start).map_err(|e| js_error(&e))?;
+        let end = offset_from_f64(end).map_err(|e| js_error(&e))?;
+        serve_filtered(&self.inner, &(start..end), origin).map_err(|e| js_error(&e))
     }
 }
 
@@ -758,6 +897,256 @@ impl WasmOutcome {
             .redact(bytes)
             .map_err(|e| js_error(&e.to_string()))
     }
+}
+
+/// What a format needs, beyond its index, to plan a filtered view.
+///
+/// Held beside the index because both plans want something the index does not
+/// carry: `rewrite::plan` wants the footer thrift verbatim, and `sparse::plan`
+/// wants the [`CogLayout`] -- the tile-array *locations*, which the index
+/// deliberately does not expose because nothing but the write path may write
+/// there. Captured at build time, since the window the index was built from is
+/// the only place either one is available and the browser throws it away
+/// (`web/engine.js` reads a 16 KiB window and keeps the index).
+#[derive(Debug, Clone)]
+pub enum Filterable {
+    /// The bytes of the `Metadata { name: "footer" }` region, exactly.
+    Parquet {
+        footer_body: Vec<u8>,
+    },
+    Cog {
+        layout: Box<CogLayout>,
+    },
+}
+
+/// A planned filtered view of an object.
+///
+/// One variant per write path. Both are position-keyed below their structure
+/// and neither needs the whole object to plan -- measured from the same 16 KiB
+/// windows the demo already fetches.
+#[derive(Debug)]
+pub enum Filtered {
+    Parquet(Rewrite),
+    Cog(Sparse),
+}
+
+impl Filtered {
+    /// The length of the view a client sees.
+    pub fn virtual_size(&self) -> u64 {
+        match self {
+            Filtered::Parquet(r) => r.virtual_size(),
+            Filtered::Cog(s) => s.virtual_size(),
+        }
+    }
+
+    /// The length of the object in storage.
+    pub fn original_size(&self) -> u64 {
+        match self {
+            Filtered::Parquet(r) => r.original_size(),
+            Filtered::Cog(s) => s.object_size(),
+        }
+    }
+
+    /// The offset at and above which bytes come from [`Filtered::tail`] rather
+    /// than from the origin.
+    ///
+    /// For a COG this is the object size: `sparse` edits the tile arrays in
+    /// place and preserves every offset, so there is no tail and every byte is
+    /// an origin byte. Writing it this way lets one address calculation serve
+    /// both formats instead of two that must be kept in agreement.
+    pub fn tail_start(&self) -> u64 {
+        match self {
+            Filtered::Parquet(r) => r.footer_start(),
+            Filtered::Cog(s) => s.object_size(),
+        }
+    }
+
+    /// The resident bytes at and above [`Filtered::tail_start`]. Empty for a COG.
+    pub fn tail(&self) -> Vec<u8> {
+        match self {
+            Filtered::Parquet(r) => r.tail(),
+            Filtered::Cog(_) => Vec::new(),
+        }
+    }
+
+    /// A validator for the view, not for the object. See
+    /// [`Rewrite::etag`](crate::rewrite::Rewrite::etag).
+    pub fn etag(&self) -> String {
+        match self {
+            Filtered::Parquet(r) => r.etag(),
+            Filtered::Cog(s) => s.etag(),
+        }
+    }
+
+    /// The verdict for a range of *origin* offsets, carrying the blank spans.
+    pub fn object_verdict(&self, range: &Range<u64>) -> Verdict {
+        match self {
+            Filtered::Parquet(r) => r.object_verdict(range),
+            Filtered::Cog(s) => s.object_verdict(range),
+        }
+    }
+
+    /// What was withheld, as the JSON the demo renders. A list of columns for
+    /// Parquet, of tiles for a COG, discriminated by `kind`.
+    pub fn withheld_json(&self) -> String {
+        let value = match self {
+            Filtered::Parquet(r) => {
+                let columns: Vec<Value> = r
+                    .withheld()
+                    .iter()
+                    .map(|w| {
+                        json!({
+                            "column": w.column,
+                            "deniedKinds": w.denied_kinds,
+                            "regions": w.regions,
+                            "bytes": w.bytes,
+                        })
+                    })
+                    .collect();
+                json!({
+                    "kind": "columns",
+                    "withheld": columns,
+                    "groupsPruned": r.groups_pruned(),
+                    "strippedKeys": r.stripped_keys(),
+                })
+            }
+            Filtered::Cog(s) => {
+                let tiles: Vec<Value> = s
+                    .withheld()
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "overviewLevel": t.overview_level,
+                            "x": t.x,
+                            "y": t.y,
+                        })
+                    })
+                    .collect();
+                json!({
+                    "kind": "tiles",
+                    "withheld": tiles,
+                    "blankedBytes": s.blanked_bytes(),
+                })
+            }
+        };
+        value.to_string()
+    }
+
+    /// Every span of origin bytes this view zeroes, as `[start, end, ...]`
+    /// pairs. For display: the serving path never asks JS to apply them.
+    pub fn scrub_pairs(&self) -> Vec<f64> {
+        let spans: &[Range<u64>] = match self {
+            Filtered::Parquet(r) => r.scrub(),
+            Filtered::Cog(s) => s.scrub(),
+        };
+        spans
+            .iter()
+            .flat_map(|s| [s.start as f64, s.end as f64])
+            .collect()
+    }
+}
+
+/// Plan a filtered view.
+///
+/// The same two calls `examples/gate.rs` makes, behind one signature, so the
+/// browser and the gateway cannot drift in which errors they surface. Both
+/// refuse a policy they cannot express faithfully (issue #27), and that
+/// refusal is the interesting output as often as the plan is -- it is how the
+/// demo can show *why* a rule is unsupportable in a mode.
+pub fn plan_filtered(
+    index: &LayoutIndex,
+    filterable: &Filterable,
+    policy: &Policy,
+    user: &Value,
+) -> Result<Filtered, String> {
+    match filterable {
+        Filterable::Parquet { footer_body } => rewrite::plan(index, footer_body, policy, user)
+            .map(Filtered::Parquet)
+            .map_err(|e| e.to_string()),
+        Filterable::Cog { layout } => sparse::plan(index, layout, policy, user)
+            .map(Filtered::Cog)
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// The origin bytes a caller must fetch to serve `[start, end)` of the view.
+///
+/// Empty when the range lies entirely in the resident tail, which is the
+/// common case for a footer read of a rewritten Parquet: the reader asks for
+/// the last 16 KiB and no origin request is needed at all.
+pub fn origin_range(filtered: &Filtered, virtual_range: &Range<u64>) -> Range<u64> {
+    let tail_start = filtered.tail_start();
+    let lo = virtual_range.start.min(tail_start);
+    let hi = virtual_range.end.min(tail_start);
+    lo..hi
+}
+
+/// Assemble `[start, end)` of the view from the origin bytes for
+/// [`origin_range`].
+///
+/// This is `examples/gate.rs`'s serving loop with the file handle replaced by
+/// a slice, and it is deliberately the only place the arithmetic exists on
+/// this side of the boundary. A caller given the scrub spans and asked to
+/// zero them itself would be a second implementation of the redaction, and
+/// the second implementation is the one nobody audits.
+///
+/// A [`Verdict`] that cannot be redacted leaves the buffer zeroed rather than
+/// returning origin bytes, which is the direction that fails safe.
+pub fn serve_filtered(
+    filtered: &Filtered,
+    virtual_range: &Range<u64>,
+    origin: &[u8],
+) -> Result<Vec<u8>, String> {
+    if virtual_range.start > virtual_range.end {
+        return Err("range start is after its end".into());
+    }
+    if virtual_range.end > filtered.virtual_size() {
+        return Err(format!(
+            "range ends at {} but the view is {} bytes",
+            virtual_range.end,
+            filtered.virtual_size()
+        ));
+    }
+
+    let physical = origin_range(filtered, virtual_range);
+    let expected = (physical.end - physical.start) as usize;
+    if origin.len() != expected {
+        return Err(format!(
+            "expected {expected} origin bytes for {}..{}, got {}",
+            physical.start,
+            physical.end,
+            origin.len()
+        ));
+    }
+
+    let mut out = Vec::with_capacity((virtual_range.end - virtual_range.start) as usize);
+
+    // Below the structure: origin bytes at their own offsets, scrubbed.
+    if !physical.is_empty() {
+        let mut buf = origin.to_vec();
+        let verdict = filtered.object_verdict(&physical);
+        if verdict.redact(&mut buf).is_err() {
+            buf.fill(0);
+        }
+        out.extend_from_slice(&buf);
+    }
+
+    // At or above it: the resident tail, indexed from `tail_start`.
+    let tail_start = filtered.tail_start();
+    if virtual_range.end > tail_start {
+        let tail = filtered.tail();
+        let lo = (virtual_range.start.max(tail_start) - tail_start) as usize;
+        let hi = (virtual_range.end - tail_start) as usize;
+        if hi > tail.len() {
+            return Err(format!(
+                "range reaches {hi} bytes into a {}-byte tail",
+                tail.len()
+            ));
+        }
+        out.extend_from_slice(&tail[lo..hi]);
+    }
+
+    Ok(out)
 }
 
 /// Every refusal crosses as a real JS `Error`.
@@ -1275,7 +1664,7 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let bytes = std::fs::read(root.join("data/nyc-taxi-8rg.parquet")).unwrap();
         let size = bytes.len() as u64;
-        let idx = build_index(Format::Parquet, &bytes, size).unwrap();
+        let (idx, _) = build_index(Format::Parquet, &bytes, size).unwrap();
         let pol = policy();
         let first = check_offsets(&idx, &pol, &analyst(), 0, 4);
         for _ in 0..100 {
@@ -1286,6 +1675,201 @@ mod tests {
         let listed: Value = serde_json::from_str(&regions_json(&idx)).unwrap();
         let v = verdicts(&idx, &pol, &analyst());
         assert_eq!(listed.as_array().unwrap().len(), v.len());
+    }
+
+    // ---- the filtered view ----------------------------------------------
+
+    /// The window the browser actually reads: `web/engine.js` fetches 16 KiB
+    /// from the end for Parquet and from the start for a COG. Planning from
+    /// anything larger would be testing a path the demo never takes.
+    const WINDOW: usize = 16 * 1024;
+
+    fn sample(rel: &str) -> Vec<u8> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        std::fs::read(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    }
+
+    fn withholding(columns: &[&str]) -> Policy {
+        let mut yaml = String::from("allow:\n  - \"region.kind = 'metadata'\"\n");
+        let clauses: Vec<String> = columns
+            .iter()
+            .map(|c| format!("region.column <> '{c}'"))
+            .collect();
+        yaml.push_str(&format!("  - \"{}\"\n", clauses.join(" AND ")));
+        Policy::load(&yaml, QUERYABLES).expect("policy")
+    }
+
+    // The claim that makes the browser demo possible at all: both plans work
+    // from the 16 KiB window the page already fetches, with no second request
+    // and no whole-object read. The Parquet footer is 15,857 bytes of it, so
+    // this passes with 519 bytes to spare -- worth knowing, because a file
+    // with a larger footer needs a larger window and the error says so.
+    #[test]
+    fn both_plans_work_from_the_window_the_browser_already_fetches() {
+        let parquet = sample("data/nyc-taxi-8rg.parquet");
+        let size = parquet.len() as u64;
+        let (index, filterable) =
+            build_index(Format::Parquet, &parquet[parquet.len() - WINDOW..], size).unwrap();
+        let filtered = plan_filtered(
+            &index,
+            &filterable,
+            &withholding(&["fare_amount", "tip_amount"]),
+            &analyst(),
+        )
+        .expect("a plan from a 16 KiB window");
+        assert!(filtered.virtual_size() < filtered.original_size());
+        assert_eq!(filtered.original_size(), size);
+
+        let cog = sample("data/s2-tci-512.tif");
+        let cog_size = cog.len() as u64;
+        let (index, filterable) = build_index(Format::Cog, &cog[..WINDOW], cog_size).unwrap();
+        let policy = Policy::load(
+            "allow:\n  - \"region.kind = 'metadata'\"\n  - \"region.overview_level > 0\"\n",
+            QUERYABLES,
+        )
+        .unwrap();
+        let filtered = plan_filtered(&index, &filterable, &policy, &analyst()).expect("a plan");
+        // Sparsify preserves every offset, so there is no tail and the view is
+        // exactly as long as the object.
+        assert_eq!(filtered.virtual_size(), cog_size);
+        assert_eq!(filtered.tail_start(), cog_size);
+        assert!(filtered.tail().is_empty());
+    }
+
+    // A reader's first move on a Parquet file is to read the last few KiB.
+    // Under a rewrite that range is entirely resident, so the gateway answers
+    // it without touching the origin at all -- which is the single best thing
+    // about serving a rewritten tail rather than a whole rewritten object.
+    #[test]
+    fn a_footer_read_of_a_rewritten_view_needs_no_origin_bytes() {
+        let parquet = sample("data/nyc-taxi-8rg.parquet");
+        let size = parquet.len() as u64;
+        let (index, filterable) =
+            build_index(Format::Parquet, &parquet[parquet.len() - WINDOW..], size).unwrap();
+        let filtered = plan_filtered(
+            &index,
+            &filterable,
+            &withholding(&["fare_amount"]),
+            &analyst(),
+        )
+        .unwrap();
+
+        let virtual_size = filtered.virtual_size();
+        let want = virtual_size - 8192..virtual_size;
+        assert!(
+            origin_range(&filtered, &want).is_empty(),
+            "a footer read should need no origin bytes"
+        );
+        let served = serve_filtered(&filtered, &want, &[]).expect("served from the tail alone");
+        assert_eq!(served.len(), 8192);
+
+        // And it really is the rewritten tail, not the original's: the last
+        // four bytes of a Parquet file are its magic, so compare the thrift
+        // just below it instead.
+        let tail = filtered.tail();
+        assert_eq!(served[..], tail[tail.len() - 8192..]);
+    }
+
+    // The whole point of putting the arithmetic here: a view assembled through
+    // this boundary in the browser's chunk sizes must equal one assembled in a
+    // single call. If it did not, the demo would be showing bytes no gateway
+    // would ever serve.
+    #[test]
+    fn a_view_assembled_in_pieces_equals_one_assembled_whole() {
+        let parquet = sample("data/nyc-taxi-8rg.parquet");
+        let size = parquet.len() as u64;
+        let (index, filterable) =
+            build_index(Format::Parquet, &parquet[parquet.len() - WINDOW..], size).unwrap();
+        let filtered = plan_filtered(
+            &index,
+            &filterable,
+            &withholding(&["fare_amount", "tip_amount"]),
+            &analyst(),
+        )
+        .unwrap();
+        let virtual_size = filtered.virtual_size();
+
+        let fetch = |range: &Range<u64>| {
+            let physical = origin_range(&filtered, range);
+            parquet[physical.start as usize..physical.end as usize].to_vec()
+        };
+
+        let whole = 0..virtual_size;
+        let reference = serve_filtered(&filtered, &whole, &fetch(&whole)).expect("whole");
+        assert_eq!(reference.len() as u64, virtual_size);
+
+        // 64 KiB pieces, which is what a block-aligned reader issues, crossing
+        // the footer boundary partway through one of them.
+        let mut assembled = Vec::with_capacity(reference.len());
+        let mut cursor = 0u64;
+        while cursor < virtual_size {
+            let piece = cursor..(cursor + 65_536).min(virtual_size);
+            assembled.extend_from_slice(
+                &serve_filtered(&filtered, &piece, &fetch(&piece)).expect("piece"),
+            );
+            cursor = piece.end;
+        }
+        assert_eq!(assembled, reference);
+
+        // The withheld bytes really are gone from what was served. The scrub
+        // spans are origin offsets, and below the footer an origin offset is
+        // also a view offset, so they index the assembled bytes directly.
+        let pairs = filtered.scrub_pairs();
+        assert!(!pairs.is_empty(), "nothing was scrubbed");
+        for span in pairs.chunks(2) {
+            let (lo, hi) = (span[0] as usize, span[1] as usize);
+            assert!(
+                reference[lo..hi].iter().all(|b| *b == 0),
+                "{lo}..{hi} was served live"
+            );
+        }
+    }
+
+    // A caller that fetched the wrong bytes gets an error, not a view
+    // assembled from whatever it happened to pass. Silence here would be a
+    // reader parsing a plausible-looking file made of the wrong offsets.
+    #[test]
+    fn serving_refuses_an_origin_buffer_of_the_wrong_length() {
+        let parquet = sample("data/nyc-taxi-8rg.parquet");
+        let size = parquet.len() as u64;
+        let (index, filterable) =
+            build_index(Format::Parquet, &parquet[parquet.len() - WINDOW..], size).unwrap();
+        let filtered = plan_filtered(
+            &index,
+            &filterable,
+            &withholding(&["fare_amount"]),
+            &analyst(),
+        )
+        .unwrap();
+
+        let want = 0..1000u64;
+        assert!(serve_filtered(&filtered, &want, &[0; 999]).is_err());
+        assert!(serve_filtered(&filtered, &want, &[0; 1001]).is_err());
+        assert!(serve_filtered(&filtered, &want, &[0; 1000]).is_ok());
+
+        // Past the end of the view, which is a different mistake and gets its
+        // own error rather than a truncated read.
+        let past = filtered.virtual_size() - 10..filtered.virtual_size() + 10;
+        assert!(serve_filtered(&filtered, &past, &[]).is_err());
+    }
+
+    // Issue #27's refusal has to reach the page as a message, because showing
+    // *why* a rule cannot be honoured in a mode is the thing the demo is for.
+    #[test]
+    fn a_policy_a_mode_cannot_express_crosses_as_a_message() {
+        let parquet = sample("data/nyc-taxi-8rg.parquet");
+        let size = parquet.len() as u64;
+        let (index, filterable) =
+            build_index(Format::Parquet, &parquet[parquet.len() - WINDOW..], size).unwrap();
+        // Permits the columns, denies the structure.
+        let policy = Policy::load(
+            "allow:\n  - \"region.kind IN ('column_chunk', 'column_index', 'bloom_filter',              'column_metadata')\"\n",
+            QUERYABLES,
+        )
+        .unwrap();
+        let err = plan_filtered(&index, &filterable, &policy, &analyst()).unwrap_err();
+        assert!(err.contains("denies structure"), "{err}");
+        assert!(err.contains("footer"), "{err}");
     }
 
     #[test]
