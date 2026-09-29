@@ -1,0 +1,40 @@
+-- Hide two landmarks at full resolution, everywhere else in the clear.
+--
+-- The shape of a real imagery restriction: the whole city is published, and a
+-- handful of sensitive locations are not. It is also the case where the
+-- spatial predicate has to be written the OTHER way round from a licensing
+-- rule, which is the point of keeping both example policies.
+
+-- The structure, without which no reader can find any tile.
+region.kind = 'metadata'
+
+-- Every overview. A restriction that also blanked the coarse levels would take
+-- the whole city dark when zoomed out -- the single level-5 tile covers all of
+-- it -- so this publishes them, and in doing so states plainly that the
+-- withheld locations are still visible at 20 m and worse. That trade is the
+-- publisher's to make and it is better made in the open: see
+-- `hide-landmarks-everywhere.cql2` for the version that pays the other cost.
+OR region.overview_level > 0
+
+-- Full resolution, except where it is not.
+--
+-- `NOT S_INTERSECTS(region.geom, <area>)` and NOT
+-- `NOT S_CONTAINS(<area>, region.geom)`. The safe direction inverts with the
+-- direction of the rule, and it is worth being precise about why.
+--
+-- A tile is served whole. So when an area GRANTS access, a tile qualifies only
+-- if it is entirely inside -- `S_CONTAINS(<area>, region.geom)` -- or pixels
+-- outside the grant go out with it. When an area DENIES access, the same
+-- reasoning runs the other way: a tile must be withheld if it touches the area
+-- at all, because any overlap means some of the protected ground is in it.
+--
+-- Measured on this file: with `NOT S_INTERSECTS` the two landmarks withhold 21
+-- tiles. Written as `NOT S_CONTAINS(<area>, region.geom)` -- which reads like
+-- the same intent -- it withholds **nothing at all**, because no tile is
+-- wholly inside a 200 m box when the tiles are 153 m across. A rule that
+-- protects zero tiles and looks correct is the worst thing in this file.
+OR (region.overview_level = 0
+    AND NOT S_INTERSECTS(region.geom, POLYGON((
+      255320 6250770, 255525 6250770, 255525 6250975, 255320 6250975, 255320 6250770)))
+    AND NOT S_INTERSECTS(region.geom, POLYGON((
+      255350 6253350, 255610 6253350, 255610 6253600, 255350 6253600, 255350 6253350))))

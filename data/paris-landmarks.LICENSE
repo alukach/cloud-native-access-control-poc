@@ -1,0 +1,17 @@
+data/paris-landmarks.tif
+========================
+
+Source:  BD ORTHO, via the IGN Géoplateforme WMTS
+         https://data.geopf.fr/wmts  (layer ORTHOIMAGERY.ORTHOPHOTOS)
+Area:    Paris 7th/8th/16th arrondissements — the Eiffel Tower, the
+         Trocadéro and the Arc de Triomphe.
+Licence: Licence Ouverte / Open Licence, version 2.0 (Etalab)
+         https://www.etalab.gouv.fr/licence-ouverte-open-licence/
+         Attribution required.
+
+    © IGN — https://www.ign.fr/
+
+Regenerate with `./scripts/make-paris.sh`, which fetches the tiles and
+rebuilds the COG. It is included in this repository as a sample rather than
+fetched at build time so the demo has something to show offline, and because a
+COG whose tiling this project depends on should not change under it silently.

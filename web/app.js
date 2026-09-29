@@ -94,9 +94,10 @@ async function loadFile() {
     renderSuggestions();
     // Policies are per format, so an id carried over from the other one names
     // nothing. Fall back rather than leaving every chip unselected.
-    const known = policiesFor(source.format).some((p) => p.id === state.policyId);
+    const sample = state.url ? null : state.sample;
+    const known = policiesFor(source.format, sample).some((p) => p.id === state.policyId);
     const sameFormat = known && state.policyText;
-    choosePolicy(known ? state.policyId : policiesFor(source.format)[0].id,
+    choosePolicy(known ? state.policyId : policiesFor(source.format, sample)[0].id,
       { keepText: sameFormat });
     renderReaders();
     $('inspect-result').hidden = true;
@@ -385,14 +386,15 @@ function renderPolicyPresets() {
   const host = $('policy-presets');
   host.textContent = '';
   const format = state.file?.format || 'parquet';
-  for (const preset of policiesFor(format)) {
+  const sample = state.url ? null : state.sample;
+  for (const preset of policiesFor(format, sample)) {
     const chip = el('button', `chip${state.policyId === preset.id ? ' on' : ''}`);
     chip.type = 'button';
     chip.append(el('b', '', preset.name));
     chip.addEventListener('click', () => choosePolicy(preset.id));
     host.append(chip);
   }
-  const current = policiesFor(format).find((p) => p.id === state.policyId);
+  const current = policiesFor(format, sample).find((p) => p.id === state.policyId);
   $('policy-blurb').textContent = current?.blurb || '';
 }
 
@@ -400,7 +402,11 @@ function choosePolicy(id, { keepText = false } = {}) {
   const format = state.file?.format || 'parquet';
   state.policyId = id;
   const area = AREAS.find((a) => a.id === state.area) || AREAS[0];
-  const { text } = buildPolicy(format, id, { area: area.id, bbox: area.bbox });
+  const { text } = buildPolicy(format, id, {
+    area: area.id,
+    bbox: area.bbox,
+    sample: state.url ? null : state.sample,
+  });
   if (!keepText || !state.policyText) {
     state.policyText = text;
     $('policy').value = text;

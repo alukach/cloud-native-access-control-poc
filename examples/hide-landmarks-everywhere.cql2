@@ -1,0 +1,19 @@
+-- The same two landmarks, withheld at every zoom level.
+--
+-- The honest version of `hide-landmarks.cql2`, and the one that shows what
+-- honesty costs. Overviews are built by averaging the level below, so the
+-- pixels over a withheld location are present in every coarser tile too. To
+-- actually hide the location you have to withhold those tiles as well -- and
+-- one level-5 tile covers the entire image, so the zoomed-out view goes black.
+--
+-- There is no third option at tile granularity. Either the location is
+-- recoverable from the overviews, or the overviews are unusable. Choosing
+-- means deciding which of the two you can live with.
+
+region.kind = 'metadata'
+
+OR (region.kind = 'tile'
+    AND NOT S_INTERSECTS(region.geom, POLYGON((
+      255320 6250770, 255525 6250770, 255525 6250975, 255320 6250975, 255320 6250770)))
+    AND NOT S_INTERSECTS(region.geom, POLYGON((
+      255350 6253350, 255610 6253350, 255610 6253600, 255350 6253600, 255350 6253350))))

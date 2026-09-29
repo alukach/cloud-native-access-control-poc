@@ -3,6 +3,16 @@
 
 export const SAMPLES = [
   {
+    id: 'paris',
+    format: 'cog',
+    name: 'Paris — landmarks',
+    path: '../data/paris-landmarks.tif',
+    blurb: 'IGN orthophoto at 0.4 m, 476 tiles of 153 m each. The Eiffel Tower and the '
+      + 'Arc de Triomphe are unmistakable, which is the point: when a policy withholds '
+      + 'them you can see exactly what left.',
+    attribution: '© IGN — Licence Ouverte 2.0',
+  },
+  {
     id: 'nyc-taxi',
     format: 'parquet',
     name: 'NYC taxi trips',
@@ -13,10 +23,10 @@ export const SAMPLES = [
   {
     id: 's2-tci',
     format: 'cog',
-    name: 'Sentinel-2 true colour',
+    name: 'Sentinel-2 granule',
     path: '../data/s2-tci-512.tif',
-    blurb: '5 MB, 6 overview levels, 655 tiles. A full-coverage granule, so tiles are '
-      + '~76 kB and no two share a 64 KiB block.',
+    blurb: '5 MB, 6 overview levels, 655 tiles at 10 m. The licensing case rather than '
+      + 'the redaction one: an area is granted, not withheld.',
   },
 ];
 
@@ -67,8 +77,6 @@ const withoutColumns = (columns) =>
  */
 const inside = (wkt) => `region.kind = 'tile' AND S_CONTAINS(${wkt}, region.geom)`;
 
-const ring = ([x0, y0, x1, y1]) =>
-  `POLYGON((${x0} ${y0},${x1} ${y0},${x1} ${y1},${x0} ${y1},${x0} ${y0}))`;
 
 /** Tile-grid aligned on data/s2-tci-512.tif: 5,120 m from (499980, 4200000). */
 export const AREAS = [
@@ -77,7 +85,88 @@ export const AREAS = [
   { id: 'scene', name: 'The whole scene', tiles: 'all', bbox: [499980, 4090200, 609780, 4200000] },
 ];
 
+const ring = ([x0, y0, x1, y1]) =>
+  `POLYGON((${x0} ${y0},${x1} ${y0},${x1} ${y1},${x0} ${y1},${x0} ${y0}))`;
+
+/**
+ * Two landmarks, in the file's own CRS (EPSG:3857 metres).
+ *
+ * Boxes rather than outlines: a tile is served whole, so a polygon finer than
+ * the tile grid buys nothing, and a box is something a reader of the policy
+ * can check against a map.
+ */
+export const LANDMARKS = [
+  {
+    id: 'eiffel',
+    name: 'Eiffel Tower',
+    bbox: [255320, 6250770, 255525, 6250975],
+  },
+  {
+    id: 'arc',
+    name: 'Arc de Triomphe',
+    bbox: [255350, 6253350, 255610, 6253600],
+  },
+];
+
+/**
+ * Withhold every tile that TOUCHES an area.
+ *
+ * The inverse of `inside`, and the inversion is the whole point. A tile is
+ * served whole, so an area that GRANTS access must contain a tile entirely
+ * before that tile is served, while an area that DENIES access must withhold
+ * a tile that overlaps it at all. Both are the conservative direction; they
+ * are opposite predicates.
+ *
+ * Measured on data/paris-landmarks.tif: `NOT S_INTERSECTS` withholds 21 tiles
+ * for these two landmarks. Spelled `NOT S_CONTAINS(<area>, region.geom)` --
+ * which reads like the same intent -- it withholds **nothing**, because no
+ * 153 m tile sits wholly inside a 205 m box.
+ */
+const outside = (areas) =>
+  areas.map((a) => `NOT S_INTERSECTS(region.geom, ${ring(a.bbox)})`).join('\n     AND ');
+
 export const POLICIES = {
+  paris: [
+    {
+      id: 'hide-landmarks',
+      name: 'Hide the landmarks',
+      blurb: 'Full resolution everywhere except over the Eiffel Tower and the Arc de '
+        + 'Triomphe. Zoom in and they are gone; zoom out and the overviews still show '
+        + 'them, coarsely — which the policy says out loud rather than hiding.',
+      build: () => doc([
+        STRUCTURE,
+        'region.overview_level > 0',
+        `region.overview_level = 0\n     AND ${outside(LANDMARKS)}`,
+      ]),
+    },
+    {
+      id: 'hide-everywhere',
+      name: 'Hide them at every zoom',
+      blurb: 'The honest version, and what it costs. Overviews average the level below, '
+        + 'so hiding a location properly means hiding it in the coarse tiles too — and '
+        + 'one level-5 tile covers the whole city.',
+      build: () => doc([STRUCTURE, `region.kind = 'tile'\n     AND ${outside(LANDMARKS)}`]),
+    },
+    {
+      id: 'wrong-predicate',
+      name: 'The predicate written backwards',
+      blurb: 'The same intent with S_CONTAINS instead of S_INTERSECTS. It reads correctly '
+        + 'and it protects nothing at all: no 153 m tile fits inside a 205 m box, so every '
+        + 'landmark tile is served.',
+      build: () => doc([
+        STRUCTURE,
+        `region.kind = 'tile'\n     AND ${LANDMARKS.map((a) =>
+          `NOT S_CONTAINS(${ring(a.bbox)}, region.geom)`).join('\n     AND ')}`,
+      ]),
+    },
+    {
+      id: 'open',
+      name: 'Publish everything',
+      blurb: 'The baseline. Nothing withheld, and the served file is byte-identical to '
+        + 'the stored one.',
+      build: () => doc([STRUCTURE, "region.kind = 'tile'"]),
+    },
+  ],
   parquet: [
     {
       id: 'withhold-fares',
@@ -148,10 +237,20 @@ export const POLICIES = {
   ],
 };
 
-export const policiesFor = (format) => POLICIES[format] || [];
+/**
+ * The policies offered for a file.
+ *
+ * Keyed by sample first, because a spatial rule names coordinates in that
+ * file's CRS and a polygon over Paris means nothing over a Sentinel granule.
+ * A file loaded from a URL gets the format's generic set, which names no
+ * coordinates at all.
+ */
+export const policiesFor = (format, sampleId) =>
+  (sampleId && POLICIES[sampleId]) || POLICIES[format] || [];
 
 export function buildPolicy(format, id, ctx = {}) {
-  const preset = policiesFor(format).find((p) => p.id === id) || policiesFor(format)[0];
+  const available = policiesFor(format, ctx.sample);
+  const preset = available.find((p) => p.id === id) || available[0];
   const area = AREAS.find((a) => a.id === (ctx.area || preset.area)) || AREAS[0];
   return {
     preset,
