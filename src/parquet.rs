@@ -685,7 +685,7 @@ mod tests {
     fn a_policy_denying_salary_does_not_deny_employee_salary() {
         let idx = index(&read("tests/fixtures/nested.parquet"));
         let policy = Policy::load(
-            "allow:\n  - \"region.kind = 'column_chunk' AND region.column NOT IN ('salary')\"",
+            "region.kind = 'column_chunk' AND region.column NOT IN ('salary')",
             QUERYABLES,
         )
         .unwrap();
@@ -893,18 +893,10 @@ mod tests {
         // It is the column's, not metadata's: rule 8 forbids a blanket
         // `region.kind = 'metadata'` allow from reaching a structure that
         // spells out a column's name and its chunk-level min and max.
-        let blanket = Policy::load(
-            "allow:\n  - \"region.kind = 'metadata'\"",
-            crate::policy::QUERYABLES,
-        )
-        .unwrap();
+        let blanket = Policy::load("region.kind = 'metadata'", crate::policy::QUERYABLES).unwrap();
         assert!(!blanket.permits(&json!({"user": {}, "region": at[0].props()})));
         // And it answers to a rule about that column.
-        let about_id = Policy::load(
-            "allow:\n  - \"region.column = 'id'\"",
-            crate::policy::QUERYABLES,
-        )
-        .unwrap();
+        let about_id = Policy::load("region.column = 'id'", crate::policy::QUERYABLES).unwrap();
         assert!(about_id.permits(&json!({"user": {}, "region": at[0].props()})));
     }
 
@@ -1325,8 +1317,7 @@ mod tests {
         let bytes = read("data/nyc-taxi-8rg.parquet");
         let idx = index(&bytes);
         let policy = Policy::load(
-            "allow:\n  - \"region.kind = 'metadata'\"\n  \
-             - \"region.kind = 'column_chunk' AND region.column <> 'total_amount'\"",
+            "(region.kind = 'metadata') OR (region.kind = 'column_chunk' AND region.column <> 'total_amount')",
             QUERYABLES,
         )
         .unwrap();

@@ -565,15 +565,12 @@ mod tests {
     }
 
     fn policy(rules: &[&str]) -> Policy {
-        let yaml = std::iter::once("allow:".to_string())
-            .chain(
-                rules
-                    .iter()
-                    .map(|r| format!("  - \"{}\"", r.replace('"', "'"))),
-            )
+        let text = rules
+            .iter()
+            .map(|r| format!("({})", r.replace('"', "'")))
             .collect::<Vec<_>>()
-            .join("\n");
-        Policy::load(&yaml, crate::policy::QUERYABLES).unwrap_or_else(|e| panic!("{yaml}: {e}"))
+            .join(" OR ");
+        Policy::load(&text, crate::policy::QUERYABLES).unwrap_or_else(|e| panic!("{text}: {e}"))
     }
 
     /// Permit the structure, every overview, and every full-resolution tile

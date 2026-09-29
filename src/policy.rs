@@ -27,15 +27,14 @@
 //! reach rather than the outcome they observe.
 
 use cql2::Expr;
-use serde::Deserialize;
 use serde_json::Value;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
-    #[error("policy is not valid YAML: {0}")]
-    Yaml(#[from] serde_norway::Error),
-    #[error("filter does not parse as CQL2: {0}")]
+    #[error("policy does not parse as CQL2: {0}")]
     Parse(String),
+    #[error("policy is empty; a policy that grants nothing should say so explicitly")]
+    Empty,
     #[error("unknown property `{0}` - not in the queryables schema")]
     UnknownProperty(String),
     #[error("operator `{0}` is banned in policies")]
@@ -85,64 +84,75 @@ pub const QUERYABLES: &[&str] = &[
     "region.crs",
 ];
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PolicyFile {
-    allow: Vec<String>,
-}
-
-/// A loaded, validated allow-list. Every property named by every rule is known
-/// to be in the queryables schema; no rule can be constructed otherwise.
+/// One loaded, validated CQL2 expression: the whole policy.
+///
+/// Every property it names is known to be in the queryables schema; a policy
+/// naming anything else cannot be constructed.
 #[derive(Debug)]
 pub struct Policy {
-    rules: Vec<Expr>,
+    rule: Expr,
 }
 
 impl Policy {
-    /// Parse and validate a policy document.
+    /// Parse and validate a policy.
     ///
-    /// `queryables` is the closed set of property names a rule may name. A rule
-    /// naming anything else is a load failure, not a runtime denial -- see the
-    /// module docs for why the distinction is the whole point.
-    pub fn load(yaml: &str, queryables: &[&str]) -> Result<Self, PolicyError> {
-        let file: PolicyFile = serde_norway::from_str(yaml)?;
-        let mut rules = Vec::with_capacity(file.allow.len());
-        for src in file.allow {
-            // `Expr: FromStr` reads a leading `{` as cql2-json and anything
-            // else as cql2-text. Both paths normalize, so `validate` sees
-            // canonical operator spellings whichever encoding was written.
-            let expr: Expr = src
-                .parse()
-                .map_err(|e| PolicyError::Parse(format!("{e}")))?;
-            validate(&expr, queryables)?;
-            rules.push(expr);
+    /// A policy is **one CQL2 expression**, evaluated once per region. It is
+    /// permitted when the expression is true for it.
+    ///
+    /// `queryables` is the closed set of property names the expression may
+    /// name. Naming anything else is a load failure, not a runtime denial --
+    /// see the module docs for why the distinction is the whole point.
+    ///
+    /// # Guard each branch on `region.kind`
+    ///
+    /// A region carries only the properties its kind has: a tile has
+    /// `overview_level` and no `column`, a column chunk the reverse. Naming a
+    /// property a region lacks leaves the comparison unresolved, and an
+    /// unresolved operand denies (see [`Policy::permits`]).
+    ///
+    /// The connectives short-circuit, so a guard keeps that from mattering:
+    ///
+    /// ```text
+    /// region.kind = 'metadata'
+    ///   OR (region.kind = 'tile' AND region.overview_level > 0)
+    ///   OR (region.kind = 'column_chunk' AND region.column <> 'salary')
+    /// ```
+    ///
+    /// Each `AND` is false for the wrong kind before its second operand is
+    /// looked at, and each `OR` is true for the right one. Written without the
+    /// guards --- `region.overview_level > 0 OR region.column <> 'salary'` ---
+    /// the expression fails to reduce for *every* region and grants nothing.
+    /// That is fail-closed and it is visible immediately, which is why this is
+    /// documented rather than enforced.
+    pub fn load(text: &str, queryables: &[&str]) -> Result<Self, PolicyError> {
+        let text = strip_comments(text);
+        if text.trim().is_empty() {
+            return Err(PolicyError::Empty);
         }
-        Ok(Self { rules })
+        // `Expr: FromStr` reads a leading `{` as cql2-json and anything else as
+        // cql2-text. Both paths normalize, so `validate` sees canonical
+        // operator spellings whichever encoding was written.
+        let rule: Expr = text
+            .as_str()
+            .parse()
+            .map_err(|e| PolicyError::Parse(format!("{e}")))?;
+        validate(&rule, queryables)?;
+        Ok(Self { rule })
     }
 
-    /// True if ANY rule matches. An evaluation error denies.
-    ///
-    /// Disjunctive over rules, so an empty allow-list denies everything -- the
-    /// right default for a document whose only content is grants.
+    /// True if the expression matches. An evaluation error denies.
     ///
     /// `unwrap_or(false)` is the fail-closed half of the contract and it covers
     /// every error `matches` can raise: an unresolved property leaves the
     /// operation unfolded and surfaces as `NonReduced`, and so does a
     /// comparison whose operands are of different kinds -- a string bound on a
-    /// numeric property, say. Both must deny. A rule that evaluates to CQL2
-    /// NULL is not an error at all (`matches` returns `Ok(false)`), which is
-    /// also a denial, so all three roads lead to the same place.
+    /// numeric property, say. Both must deny. An expression that evaluates to
+    /// CQL2 NULL is not an error at all (`matches` returns `Ok(false)`), which
+    /// is also a denial, so all three roads lead to the same place.
+    ///
+    /// This is where an unguarded branch is paid for: see [`Policy::load`].
     ///
     /// # Cost
-    ///
-    /// Each rule is cloned on each call, because `Expr::matches` consumes the
-    /// expression. Measured at ~20.6us for a spatial rule, dominated not by the
-    /// clone but by cql2 re-parsing the policy's GeoJSON through WKT on every
-    /// evaluation -- a cost inside `matches` that no amount of caching on this
-    /// side removes. Deliberately left alone: correctness of the clone (each
-    /// call starts from the pristine parsed rule, so no reduction can leak into
-    /// the next call) matters more here than the microseconds, and a `check()`
-    /// evaluates one context per overlapped region, not per byte.
     pub fn permits(&self, ctx: &Value) -> bool {
         // cql2 resolves a property by dot-path against the context and, failing
         // that, retries under `properties.{name}`. That fallback is rooted at
@@ -164,10 +174,50 @@ impl Policy {
         if obj.contains_key("properties") {
             return false;
         }
-        self.rules
-            .iter()
-            .any(|r| r.clone().matches(Some(ctx)).unwrap_or(false))
+        self.rule.clone().matches(Some(ctx)).unwrap_or(false)
     }
+}
+
+/// Remove `--` comments, which CQL2 has no syntax for.
+///
+/// A policy is a document somebody has to maintain, and an access rule that
+/// cannot carry the reason it exists is a rule that gets deleted by the next
+/// person. CQL2 itself rejects `--` -- measured against cql2 0.6 -- so this
+/// strips them before parsing, in the SQL spelling the language's own syntax
+/// otherwise follows.
+///
+/// A `--` inside a string literal is left alone. `region.column <> 'a--b'` is
+/// a legitimate rule, and truncating it there would not be a parse error; it
+/// would be a policy that silently means something else, which is the failure
+/// this whole module is built to avoid. Only single quotes are tracked because
+/// CQL2 text has no other string delimiter -- a double quote is an identifier,
+/// and one containing `--` would not be a property this crate accepts anyway.
+fn strip_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let bytes = line.as_bytes();
+        let mut in_string = false;
+        let mut cut = line.len();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\'' {
+                // `''` is an escaped quote inside a literal, not a close
+                // followed by an open, but either reading leaves `in_string`
+                // in the same state -- so the simple toggle is correct.
+                in_string = !in_string;
+            } else if !in_string && bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'-') {
+                cut = i;
+                break;
+            }
+            i += 1;
+        }
+        out.push_str(&line[..cut]);
+        // A newline, not a space: CQL2 treats them alike, and keeping the line
+        // structure means a parse error's reported column still lines up with
+        // what the author wrote.
+        out.push('\n');
+    }
+    out
 }
 
 /// Operators a policy may not use, in cql2's canonical spelling.
@@ -262,7 +312,7 @@ mod tests {
             "region.knid IS NULL",
             "region.knid = 'x' OR region.kind = 'metadata'",
         ] {
-            let err = load(&format!("allow:\n  - \"{f}\"")).unwrap_err();
+            let err = load(f).unwrap_err();
             assert!(matches!(err, PolicyError::UnknownProperty(_)), "{f}");
         }
     }
@@ -271,19 +321,18 @@ mod tests {
     fn is_null_is_banned_outright() {
         // cql2 folds an absent property to true for isNull: a guard written
         // this way grants on a typo the validator might not otherwise see.
-        let err = load("allow:\n  - \"region.column IS NULL\"").unwrap_err();
+        let err = load("region.column IS NULL").unwrap_err();
         assert!(matches!(err, PolicyError::BannedOperator(_)));
     }
 
     #[test]
     fn valid_policy_loads() {
-        assert!(load("allow:\n  - \"region.kind = 'metadata'\"").is_ok());
+        assert!(load("region.kind = 'metadata'").is_ok());
     }
 
     #[test]
     fn rules_are_disjunctive() {
-        let p =
-            load("allow:\n  - \"region.kind = 'metadata'\"\n  - \"region.kind = 'tile'\"").unwrap();
+        let p = load("(region.kind = 'metadata') OR (region.kind = 'tile')").unwrap();
         assert!(p.permits(&json!({"region":{"kind":"tile"}})));
         assert!(!p.permits(&json!({"region":{"kind":"unmapped"}})));
     }
@@ -292,21 +341,65 @@ mod tests {
     fn evaluation_error_denies() {
         // An unguarded column rule errors against a tile region. It must deny,
         // never leak through as true.
-        let p = load("allow:\n  - \"region.column <> 'salary'\"").unwrap();
+        let p = load("region.column <> 'salary'").unwrap();
         assert!(!p.permits(&json!({"region":{"kind":"tile","x":1}})));
     }
 
+    /// A policy must be able to carry the reason it exists.
     #[test]
-    fn empty_allow_list_denies_everything() {
-        let p = load("allow: []").unwrap();
-        assert!(!p.permits(&json!({"region":{"kind":"metadata"}})));
+    fn comments_are_stripped_and_a_comment_only_policy_is_empty() {
+        let documented = load(
+            "-- Everything but salary.\n\
+             region.kind = 'metadata'\n\
+             -- the columns, across all three of their region kinds\n\
+             OR region.column <> 'salary'\n",
+        )
+        .expect("a commented policy loads");
+        assert!(documented.permits(&json!({"region":{"kind":"metadata"}})));
+        assert!(!documented
+            .permits(&json!({"region":{"kind":"column_chunk","column":"salary","row_group":0}})));
+
+        // Comments alone are not a policy. Reading them as "grant nothing"
+        // would turn a file somebody forgot to finish into a working document.
+        assert!(matches!(
+            load("-- just a note\n-- and another"),
+            Err(PolicyError::Empty)
+        ));
+    }
+
+    /// The case that would not fail loudly: truncating inside a literal
+    /// produces a policy that parses and means something else.
+    #[test]
+    fn a_comment_marker_inside_a_string_literal_is_not_a_comment() {
+        let p = load("region.column = 'a--b'").expect("loads");
+        assert!(p.permits(&json!({"region":{"kind":"column_chunk","column":"a--b","row_group":0}})));
+        assert!(!p.permits(&json!({"region":{"kind":"column_chunk","column":"a","row_group":0}})));
+
+        // And a comment after a literal is still a comment.
+        let q = load("region.column = 'x' -- the public column").expect("loads");
+        assert!(q.permits(&json!({"region":{"kind":"column_chunk","column":"x","row_group":0}})));
+    }
+
+    /// An empty document is a refusal to load, not a policy that denies.
+    ///
+    /// The two are different in the direction that matters: a policy that
+    /// denies everything is a decision someone made, and an empty file is
+    /// usually a mistake -- a template never filled in, a variable that
+    /// expanded to nothing. `false` says the first thing explicitly.
+    #[test]
+    fn an_empty_policy_is_refused_rather_than_read_as_deny_all() {
+        for text in ["", "   ", "\n\t "] {
+            assert!(matches!(load(text), Err(PolicyError::Empty)), "{text:?}");
+        }
+        let explicit = load("false").unwrap();
+        assert!(!explicit.permits(&json!({"region":{"kind":"metadata"}})));
     }
 
     #[test]
     fn context_may_not_contain_a_properties_key() {
         // cql2 falls back to `properties.{name}`, so data could shadow a
         // policy property name.
-        let p = load("allow:\n  - \"region.kind = 'metadata'\"").unwrap();
+        let p = load("region.kind = 'metadata'").unwrap();
         assert!(!p.permits(&json!({"properties":{"region":{"kind":"metadata"}}})));
     }
 
@@ -345,8 +438,7 @@ mod tests {
                 "S_INTERSECTS(region.geom, bbox(region.knid, 0, 1, 1))",
             ),
         ] {
-            let err =
-                load(&format!("allow:\n  - \"{filter}\"")).unwrap_err_or_panic(variant, filter);
+            let err = load(filter).unwrap_err_or_panic(variant, filter);
             assert!(
                 matches!(err, PolicyError::UnknownProperty(ref p) if p == "region.knid"),
                 "{variant}: {filter} produced {err:?}"
@@ -363,7 +455,7 @@ mod tests {
             "NOT (region.knid = 'x')",
             "region.knid BETWEEN 1 AND 2",
         ] {
-            let err = load(&format!("allow:\n  - \"{f}\"")).unwrap_err();
+            let err = load(f).unwrap_err();
             assert!(matches!(err, PolicyError::UnknownProperty(_)), "{f}");
         }
     }
@@ -379,9 +471,11 @@ mod tests {
             "ISNULL(region.column)",
             "isnull(region.column)",
             // cql2-json: `parse` reads a leading `{` as the JSON encoding.
-            r#"{\"op\":\"isNull\",\"args\":[{\"property\":\"region.column\"}]}"#,
+            // Written plainly now -- with the YAML layer gone, so is the
+            // second round of escaping it used to need.
+            r#"{"op":"isNull","args":[{"property":"region.column"}]}"#,
         ] {
-            let err = load(&format!("allow:\n  - \"{f}\"")).unwrap_err();
+            let err = load(f).unwrap_err();
             assert!(
                 matches!(err, PolicyError::BannedOperator(_)),
                 "{f}: {err:?}"
@@ -394,7 +488,7 @@ mod tests {
     /// guard in `permits` is known to be sufficient rather than assumed to be.
     #[test]
     fn a_nested_properties_key_cannot_shadow() {
-        let p = load("allow:\n  - \"region.kind = 'metadata'\"").unwrap();
+        let p = load("region.kind = 'metadata'").unwrap();
         assert!(!p.permits(&json!({"region":{"properties":{"kind":"metadata"}}})));
         assert!(p.permits(&json!({"region":{"kind":"metadata"},"other":{"properties":{}}})));
     }
@@ -403,51 +497,58 @@ mod tests {
     /// reaches `permits` as an error rather than as a truth value.
     #[test]
     fn a_type_mismatch_denies() {
-        let p = load("allow:\n  - \"region.overview_level >= '2'\"").unwrap();
+        let p = load("region.overview_level >= '2'").unwrap();
         assert!(!p.permits(&json!({"region":{"kind":"tile","overview_level":4}})));
         // The same rule against the same value, correctly typed, does permit --
         // otherwise the assertion above would pass for the wrong reason.
-        let p = load("allow:\n  - \"region.overview_level >= 2\"").unwrap();
+        let p = load("region.overview_level >= 2").unwrap();
         assert!(p.permits(&json!({"region":{"kind":"tile","overview_level":4}})));
     }
 
     /// A present JSON `null` reduces to CQL2 NULL, which is not a match.
     #[test]
     fn a_null_valued_property_denies() {
-        let p = load("allow:\n  - \"region.column = 'salary'\"").unwrap();
+        let p = load("region.column = 'salary'").unwrap();
         assert!(!p.permits(&json!({"region":{"kind":"column_chunk","column":null}})));
     }
 
     #[test]
     fn a_filter_that_is_not_cql2_is_rejected() {
         assert!(matches!(
-            load("allow:\n  - \"region.kind = = 'x'\"").unwrap_err(),
+            load("region.kind = = 'x'").unwrap_err(),
             PolicyError::Parse(_)
         ));
     }
 
+    /// Text this crate does not understand is a refusal, not a partial read.
+    ///
+    /// A policy is one expression now, so the old hazard -- a `deny:` key
+    /// sitting beside `allow:` and silently ignored, leaving an author
+    /// believing access was restricted when it was not -- cannot be expressed.
+    /// What replaces it is the same rule at a lower level: anything that is not
+    /// one well-formed CQL2 expression fails to load rather than being read as
+    /// far as it parses.
     #[test]
-    fn a_policy_without_an_allow_key_is_rejected() {
-        assert!(matches!(
-            load("deny: []").unwrap_err(),
-            PolicyError::Yaml(_)
-        ));
-    }
-
-    /// A key this crate does not read is a key whose rules never run. Silently
-    /// ignoring `deny:` would load a policy the author believes restricts
-    /// access and that in fact does not, which is the worst way to be wrong.
-    #[test]
-    fn an_unrecognised_top_level_key_is_rejected() {
-        let err = load("allow:\n  - \"region.kind = 'tile'\"\ndeny:\n  - \"true\"").unwrap_err();
-        assert!(matches!(err, PolicyError::Yaml(_)), "{err:?}");
+    fn a_document_that_is_not_one_expression_is_rejected() {
+        for text in [
+            "allow:\n  - \"region.kind = 'tile'\"",
+            "region.kind = 'tile'\nregion.kind = 'metadata'",
+            "region.kind = 'tile' deny region.kind = 'metadata'",
+        ] {
+            assert!(
+                matches!(
+                    load(text),
+                    Err(PolicyError::Parse(_) | PolicyError::UnknownProperty(_))
+                ),
+                "{text:?} loaded"
+            );
+        }
     }
 
     /// Every rule is validated, not just the first.
     #[test]
     fn a_typo_in_a_later_rule_is_rejected() {
-        let err =
-            load("allow:\n  - \"region.kind = 'tile'\"\n  - \"region.knid = 'x'\"").unwrap_err();
+        let err = load("(region.kind = 'tile') OR (region.knid = 'x')").unwrap_err();
         assert!(matches!(err, PolicyError::UnknownProperty(_)));
     }
 
@@ -456,10 +557,7 @@ mod tests {
     /// pins what happens at runtime.
     #[test]
     fn a_known_property_absent_from_this_region_kind_still_loads() {
-        assert!(
-            load("allow:\n  - \"region.kind = 'column_chunk' AND region.column <> 'salary'\"")
-                .is_ok()
-        );
+        assert!(load("region.kind = 'column_chunk' AND region.column <> 'salary'").is_ok());
     }
 
     /// A filter that is both a typo and a banned operator reports the typo.
@@ -468,7 +566,7 @@ mod tests {
     /// say that the order is deliberate.
     #[test]
     fn a_typo_inside_a_banned_operator_reports_the_typo() {
-        let err = load("allow:\n  - \"region.knid IS NULL\"").unwrap_err();
+        let err = load("region.knid IS NULL").unwrap_err();
         assert!(matches!(err, PolicyError::UnknownProperty(ref p) if p == "region.knid"));
     }
 
@@ -476,7 +574,7 @@ mod tests {
     /// about it is authorizable.
     #[test]
     fn a_non_object_context_denies() {
-        let p = load("allow:\n  - \"true\"").unwrap();
+        let p = load("true").unwrap();
         assert!(p.permits(&json!({})));
         assert!(!p.permits(&json!([{"region":{"kind":"metadata"}}])));
         assert!(!p.permits(&json!("region")));
@@ -486,9 +584,7 @@ mod tests {
     /// Two calls must therefore agree.
     #[test]
     fn evaluating_twice_gives_the_same_answer() {
-        let p =
-            load("allow:\n  - \"S_INTERSECTS(region.geom, POLYGON((0 0,10 0,10 10,0 10,0 0)))\"")
-                .unwrap();
+        let p = load("S_INTERSECTS(region.geom, POLYGON((0 0,10 0,10 10,0 10,0 0)))").unwrap();
         let ctx = json!({"region":{"kind":"tile","geom":{"type":"Point","coordinates":[5,5]}}});
         assert!(p.permits(&ctx));
         assert!(p.permits(&ctx));

@@ -3,7 +3,7 @@
 //! ```text
 //! cargo run --release --example cog_gate -- \
 //!     --file data/s2-tci-512.tif \
-//!     --policy examples/withhold-tiles.yaml \
+//!     --policy examples/withhold-tiles.cql2 \
 //!     --user '{"role":"analyst"}' \
 //!     --port 8898 [--mode scrub|sparsify|refuse]
 //! ```
@@ -90,7 +90,7 @@ struct Gate {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut path = "data/s2-tci-512.tif".to_string();
-    let mut policy_path = "examples/withhold-tiles.yaml".to_string();
+    let mut policy_path = "examples/withhold-tiles.cql2".to_string();
     let mut user_json = r#"{"role":"analyst"}"#.to_string();
     let mut port = 8898u16;
     let mut mode = Mode::Scrub;

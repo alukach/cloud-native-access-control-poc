@@ -1,0 +1,46 @@
+-- The licence this gateway enforces on `data/s2-tci-512.tif`: full resolution
+-- only inside a licensed area, coarse imagery everywhere.
+--
+-- One CQL2 expression, evaluated once per region. Each branch guards on
+-- `region.kind` or `region.overview_level` first, because a region carries
+-- only the properties its kind has and an unresolved operand denies.
+
+-- The structure. `header`, `ghost_area`, `ifd`, `tile_offsets`,
+-- `tile_byte_counts`, `geo_keys` and `tag_values` are the only names the COG
+-- resolver emits, and without them no reader can find a tile at all --
+-- `tile_offsets` most of all, since it is the array `sparse::plan` edits.
+region.kind = 'metadata'
+
+-- Every overview, at every level. This is the shape of a real imagery licence
+-- -- browse resolution for everyone, full resolution for subscribers -- and it
+-- is also what makes the AOI recoverable: the coarse levels still show, at
+-- 20 m and worse, the ground the full-resolution rule withholds. That trade is
+-- the licensor's to make and it is stated rather than hidden.
+--
+-- `> 0` and not `>= 1` for the same reason `overview_level` is a rank and not a
+-- ratio: level 0 is full resolution, and a higher level is always coarser.
+OR region.overview_level > 0
+
+-- Full resolution, inside the licensed area only.
+--
+-- `S_CONTAINS(<area>, region.geom)` and NOT `S_INTERSECTS(region.geom, <area>)`.
+-- The difference is the whole rule. A tile is the unit of service, so an
+-- existential predicate grants a tile on *any* contact with the area and its
+-- pixels outside the licence go out with it. Measured on this exact polygon --
+-- the union of tiles x 5-9, y 5-9, edges lying on tile boundaries --
+-- `S_INTERSECTS` grants 49 tiles where `S_CONTAINS` grants 25, and four of the
+-- extra 24 touch the area along a single edge with zero interior overlap.
+--
+-- `S_CONTAINS` errs the other way: an area smaller than one tile grants
+-- nothing. For a licence that is the correct direction to be wrong in, and it
+-- is why the polygon is snapped to tile boundaries rather than drawn inside
+-- them -- a hand-drawn AOI will under-serve at the edges, which is a licensing
+-- conversation and not a leak.
+--
+-- The polygon is EPSG:32610 metres, the CRS the file's GeoKeys declare and
+-- therefore the CRS `region.geom` is in. cql2's spatial operators are planar
+-- and CRS-agnostic (issue #5), so a polygon in degrees would match nothing and
+-- deny everything -- fail-closed, but for the wrong reason.
+OR (region.overview_level = 0 AND S_CONTAINS(POLYGON((
+     525580 4148800, 551180 4148800, 551180 4174400, 525580 4174400, 525580 4148800)),
+   region.geom))

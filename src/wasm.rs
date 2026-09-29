@@ -603,8 +603,8 @@ impl WasmPolicy {
     /// parse or names a property outside the queryables schema -- which is the
     /// point of loading it ahead of time rather than at evaluation.
     #[wasm_bindgen(constructor)]
-    pub fn new(yaml: &str) -> Result<WasmPolicy, JsValue> {
-        Policy::load(yaml, QUERYABLES)
+    pub fn new(text: &str) -> Result<WasmPolicy, JsValue> {
+        Policy::load(text, QUERYABLES)
             .map(|inner| WasmPolicy { inner })
             .map_err(|e| js_error(&e.to_string()))
     }
@@ -1238,8 +1238,7 @@ mod tests {
 
     fn policy() -> Policy {
         Policy::load(
-            "allow:\n  - \"region.kind = 'metadata'\"\n  \
-             - \"region.kind = 'column_chunk' AND region.column <> 'salary'\"",
+            "(region.kind = 'metadata') OR (region.kind = 'column_chunk' AND region.column <> 'salary')",
             QUERYABLES,
         )
         .unwrap()
@@ -1690,13 +1689,15 @@ mod tests {
     }
 
     fn withholding(columns: &[&str]) -> Policy {
-        let mut yaml = String::from("allow:\n  - \"region.kind = 'metadata'\"\n");
         let clauses: Vec<String> = columns
             .iter()
             .map(|c| format!("region.column <> '{c}'"))
             .collect();
-        yaml.push_str(&format!("  - \"{}\"\n", clauses.join(" AND ")));
-        Policy::load(&yaml, QUERYABLES).expect("policy")
+        Policy::load(
+            &format!("region.kind = 'metadata' OR ({})", clauses.join(" AND ")),
+            QUERYABLES,
+        )
+        .expect("policy")
     }
 
     // The claim that makes the browser demo possible at all: both plans work
@@ -1724,7 +1725,7 @@ mod tests {
         let cog_size = cog.len() as u64;
         let (index, filterable) = build_index(Format::Cog, &cog[..WINDOW], cog_size).unwrap();
         let policy = Policy::load(
-            "allow:\n  - \"region.kind = 'metadata'\"\n  - \"region.overview_level > 0\"\n",
+            "(region.kind = 'metadata') OR (region.overview_level > 0)",
             QUERYABLES,
         )
         .unwrap();
@@ -1863,7 +1864,7 @@ mod tests {
             build_index(Format::Parquet, &parquet[parquet.len() - WINDOW..], size).unwrap();
         // Permits the columns, denies the structure.
         let policy = Policy::load(
-            "allow:\n  - \"region.kind IN ('column_chunk', 'column_index', 'bloom_filter',              'column_metadata')\"\n",
+            "region.kind IN ('column_chunk', 'column_index', 'bloom_filter',              'column_metadata')",
             QUERYABLES,
         )
         .unwrap();

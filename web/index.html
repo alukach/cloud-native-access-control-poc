@@ -4,251 +4,187 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Access control on part of a file</title>
-<meta name="description" content="A live demonstration of column-level and area-level access control over Parquet and COG byte ranges, evaluated with CQL2.">
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
 
-<div class="rail">
-  <strong>cloud-native-access-control</strong>
-  <button type="button" class="filechip" id="source-toggle"
-          aria-expanded="false" aria-controls="source-body">
-    <span id="source-name">loading…</span>
-  </button>
-  <span id="hosting"></span>
-  <span class="rail-end">
-    <span id="version">loading wasm…</span>
+<header class="top">
+  <div class="brand">
+    <b>Access control on <i>part</i> of a file</b>
+    <span>Parquet and COG, gated by byte range, enforced in a service worker</span>
+  </div>
+  <div class="top-end">
+    <span id="version">loading…</span>
     <button type="button" id="copy-link">Copy link</button>
     <span id="copy-note"></span>
-    <a href="https://github.com/alukach/cloud-native-access-control-poc">source</a>
-  </span>
-</div>
-
-<!-- The file. Folded away behind the chip in the rail until it is wanted. -->
-<section class="band" id="source-panel">
-  <div class="band-body" id="source-body" hidden>
-    <div class="toggle" role="radiogroup" aria-label="Data source">
-      <button type="button" role="radio" id="source-samples" aria-checked="true">
-        Bundled samples
-        <span>nyc-taxi-8rg.parquet · s2-tci-512.tif</span>
-      </button>
-      <button type="button" role="radio" id="source-custom" aria-checked="false">
-        A file of your own
-        <span>any Parquet or COG served over range requests</span>
-      </button>
-    </div>
-
-    <div id="custom-fields" hidden>
-      <div class="field-label">
-        <label for="source-url">Object URL</label>
-        <span class="meta" id="source-detected"></span>
-      </div>
-      <div class="source-row">
-        <input type="text" id="source-url" spellcheck="false" autocomplete="off"
-               placeholder="https://example.com/scene.tif"
-               aria-describedby="source-diag">
-        <select id="source-format" aria-label="Format"></select>
-        <button type="button" class="go" id="source-load">Load</button>
-      </div>
-      <span class="busy" id="source-busy"></span>
-      <div class="diag ok" id="source-diag"></div>
-
-      <div class="field-label"><span>Public objects that really do serve ranges to a browser</span></div>
-      <div class="chips" id="source-examples"></div>
-      <p class="preset-note" id="source-example-note"></p>
-
-      <p class="preset-note">
-        The read pattern is not the same for the two formats. Parquet keeps its footer at
-        the end, so the first read is a <em>suffix</em>; a GeoTIFF keeps its IFDs at the
-        front, so the first read is a <em>prefix</em>. Both start at 16 KB and double until
-        the metadata fits.
-      </p>
-      <p class="preset-note">
-        Cross-origin, the host has to opt in three times: <code>Access-Control-Allow-Origin</code>,
-        an <code>OPTIONS</code> answer carrying <code>Access-Control-Allow-Headers: Range</code>
-        (<code>Range</code> is not a safelisted request header, so a ranged GET preflights), and
-        <code>Access-Control-Expose-Headers: Content-Range</code>. Most buckets send none of them,
-        and no amount of code on this page can substitute for any of them.
-      </p>
-    </div>
   </div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button type="button" role="tab" id="tab-inspect" aria-selected="true">
+    <b>1 · What is in this range?</b>
+    <span>Give it a byte range. It tells you which columns, tiles and area that range exposes.</span>
+  </button>
+  <button type="button" role="tab" id="tab-query" aria-selected="false">
+    <b>2 · What does a policy withhold?</b>
+    <span>Query the file through a policy with a real engine, and see what it can no longer reach.</span>
+  </button>
+</nav>
+
+<section class="file-bar">
+  <div class="file-pick" id="file-pick"></div>
+  <div class="file-custom">
+    <input type="text" id="file-url" spellcheck="false" autocomplete="off"
+           placeholder="…or a URL to your own Parquet or COG">
+    <select id="file-format" aria-label="Format">
+      <option value="auto">detect</option>
+      <option value="parquet">Parquet</option>
+      <option value="cog">COG</option>
+    </select>
+    <button type="button" class="go" id="file-load">Load</button>
+  </div>
+  <div class="file-state" id="file-state">loading…</div>
 </section>
 
-<!-- INPUT BAND: the three things a decision is made out of, full width. -->
-<section class="band" id="setup-panel">
-  <div class="band-head">
-    <span class="band-title">Set up the run</span>
-    <span class="num band-summary" id="setup-summary"></span>
-    <button type="button" class="band-fold" id="setup-toggle"
-            aria-expanded="true" aria-controls="setup-body">collapse</button>
+<main>
+
+<!-- ---- feature 1 ---------------------------------------------------- -->
+<section class="panel" id="panel-inspect">
+
+  <div class="card">
+    <h2>The range</h2>
+    <p class="sub">A byte range on its own says nothing. Resolved against the file's own
+      metadata, it says exactly which columns or tiles it touches — and that is the
+      whole basis for deciding whether it may be served.</p>
+
+    <div class="range-row">
+      <label for="range-header">Range header</label>
+      <input type="text" id="range-header" spellcheck="false" autocomplete="off"
+             placeholder="bytes=0-65535">
+      <button type="button" class="go" id="range-go">Resolve</button>
+    </div>
+    <div class="diag" id="range-diag"></div>
+
+    <div class="lbl">Ranges a reader would really ask for</div>
+    <div class="suggestions" id="range-suggestions"></div>
   </div>
 
-  <div class="setup" id="setup-body">
-
-    <div class="step">
-      <div class="step-head">
-        <span class="stepn">1</span><h2>Query</h2><span class="hint">what you ask for</span>
+  <div class="card" id="inspect-result" hidden>
+    <h2>What that range exposes</h2>
+    <div class="facts" id="inspect-facts"></div>
+    <div class="split">
+      <div>
+        <div class="lbl">Regions it covers</div>
+        <div class="regions" id="inspect-regions"></div>
       </div>
-
-      <div id="query-parquet">
-        <div class="lbl">Columns — click to include</div>
-        <div class="colchips" id="column-chips"></div>
-        <div class="sql" id="query-sql"></div>
-      </div>
-
-      <div id="query-cog">
-        <div class="lbl">Licensed area — the COG's query</div>
-        <div class="chips" id="aoi-presets"></div>
-        <div class="row-inline">
-          <label for="cog-level">Overview level</label>
-          <select id="cog-level"></select>
+      <div>
+        <div class="lbl">Where it lands</div>
+        <div class="ruler" id="inspect-ruler"></div>
+        <div class="map-wrap" id="inspect-map-wrap" hidden>
+          <canvas id="inspect-map" width="320" height="320"></canvas>
+          <p class="note" id="inspect-map-note"></p>
         </div>
-        <div class="sql" id="cog-sql"></div>
-        <p class="preset-note" id="aoi-note"></p>
+        <details class="raw">
+          <summary>The structure itself, as the policy sees it</summary>
+          <pre id="inspect-json"></pre>
+        </details>
       </div>
-    </div>
-
-    <div class="step">
-      <div class="step-head">
-        <span class="stepn">2</span><h2>Policy</h2><span class="hint">what you are allowed to access</span>
-        <span class="num step-end" id="policy-state"></span>
-      </div>
-      <textarea id="policy" spellcheck="false" aria-describedby="policy-diag"></textarea>
-      <div class="diag ok" id="policy-diag">Loading.</div>
-      <div class="chips" id="policy-presets"></div>
-      <p class="preset-note" id="preset-note"></p>
-
-      <div class="lbl mt">When a request covers forbidden bytes</div>
-      <div class="toggle deny-modes" role="radiogroup" aria-label="Denial mode">
-        <button type="button" role="radio" id="deny-refuse" aria-checked="true">
-          Refuse it
-          <span>403, nothing served</span>
-        </button>
-        <button type="button" role="radio" id="deny-filter" aria-checked="false">
-          Serve a filtered view
-          <span>rewrite the metadata, zero the withheld bytes</span>
-        </button>
-        <button type="button" role="radio" id="deny-zerofill" aria-checked="false" disabled>
-          Zero-fill
-          <span>serve it, forbidden bytes blanked</span>
-        </button>
-      </div>
-      <p class="preset-note" id="deny-note">
-        <b>Refuse</b> is honest and it cannot serve a client that widens its reads to fixed
-        blocks — which is most of them. <b>Serve a filtered view</b> is what this project
-        recommends: the withheld bytes stay in place but zeroed, and the metadata is rebuilt
-        so nothing points at them. No request is refused, so it stops mattering how a client
-        batches its reads. Zero-fill is not wired yet, and the page will not print a result
-        it did not measure.
-      </p>
-    </div>
-
-    <div class="step">
-      <div class="step-head">
-        <span class="stepn">3</span><h2>Authentication</h2><span class="hint">who you are</span>
-      </div>
-      <div class="lbl">Claims from the token</div>
-      <textarea id="principal" spellcheck="false"></textarea>
-      <div class="diag ok" id="principal-diag"></div>
-      <p class="preset-note" id="queryable-count"></p>
     </div>
   </div>
 
-  <div class="runbar">
-    <p id="run-sentence">Loading the file.</p>
-    <div class="runbar-end">
-      <span class="run-caption" id="run-caption"></span>
-      <button type="button" class="go run" id="run-all">Run this query &nbsp;&rarr;</button>
-    </div>
-    <span class="busy" id="run-busy"></span>
+  <div class="card" id="file-meta-card">
+    <h2>The file's own metadata</h2>
+    <p class="sub">Parsed once from the end the format keeps it. Everything above is
+      derived from this and nothing else.</p>
+    <div class="facts" id="file-facts"></div>
+    <div class="lbl">Layout</div>
+    <div class="layout" id="file-layout"></div>
   </div>
+
 </section>
 
-<main class="results">
-  <div class="step-head">
-    <span class="stepn">4</span><h2>Result</h2>
-    <span class="hint">what each client fetched, and whether it survived</span>
+<!-- ---- feature 2 ---------------------------------------------------- -->
+<section class="panel" id="panel-query" hidden>
+
+  <div class="card">
+    <h2>The policy</h2>
+    <p class="sub">CQL2 over the regions a range resolves to. Pick one, or edit it —
+      it is validated as you type, and every property is checked against the schema.</p>
+    <div class="chips" id="policy-presets"></div>
+    <p class="note" id="policy-blurb"></p>
+    <textarea id="policy" spellcheck="false" rows="7"></textarea>
+    <div class="diag" id="policy-diag"></div>
+
+    <div class="two-up">
+      <div>
+        <div class="lbl">Who is asking</div>
+        <textarea id="principal" spellcheck="false" rows="2">{"role": "analyst"}</textarea>
+      </div>
+      <div>
+        <div class="lbl">How the gate answers a request covering withheld bytes</div>
+        <div class="toggle" role="radiogroup" aria-label="Mode">
+          <button type="button" role="radio" id="mode-filter" aria-checked="true">
+            Serve a filtered view
+            <span>rewrite the metadata, zero the withheld bytes, refuse nothing</span>
+          </button>
+          <button type="button" role="radio" id="mode-refuse" aria-checked="false">
+            Refuse it
+            <span>403, nothing served</span>
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 
-  <!-- The legend is first on purpose: nothing below it reads without it. -->
-  <div class="legend">
-    <span class="lbl">How to read the charts below</span>
-    <span><i class="a"></i>bytes the policy <b>allows</b></span>
-    <span><i class="d"></i>bytes it <b>forbids</b></span>
-    <span><i class="s"></i>a request covering <b>both</b> — the case that decides everything</span>
-    <span class="legend-end"><i class="p"></i>a chunk your query asked for</span>
+  <div class="card">
+    <h2>Query it</h2>
+    <p class="sub" id="query-sub"></p>
+    <div class="chips" id="reader-pick"></div>
+    <p class="note" id="reader-note"></p>
+
+    <div id="query-sql">
+      <textarea id="sql" spellcheck="false" rows="6"></textarea>
+      <p class="note">The gate is at <code id="gate-url">…</code> — an ordinary URL.
+        DuckDB is not told anything about the policy; it just reads.</p>
+    </div>
+    <div id="query-map">
+      <div class="range-row">
+        <label for="map-level">Overview level</label>
+        <select id="map-level"></select>
+      </div>
+    </div>
+
+    <div class="runbar">
+      <button type="button" class="go run" id="run-query">Run it &rarr;</button>
+      <span class="busy" id="query-busy"></span>
+    </div>
   </div>
 
-  <section class="result" id="parquet-result">
-    <div class="result-head">
-      <h3 id="parquet-title">Parquet</h3>
-      <span class="meta" id="parquet-meta"></span>
-    </div>
-    <div class="matrix" id="parquet-matrix"></div>
-    <div class="bars" id="parquet-bars"></div>
-    <div class="card filtered" id="parquet-filtered" hidden></div>
-    <div class="pair">
-      <div class="card">
-        <div class="lbl" id="parquet-grid-label">Every column chunk</div>
-        <div class="grid-block" id="parquet-grid"></div>
-        <p class="preset-note">Dark outline: a chunk your query asked for. Amber: withheld by the policy.</p>
-        <p class="preset-note" id="parquet-bloom-note"></p>
-      </div>
-      <div class="card">
-        <div class="lbl">Refusals</div>
-        <div class="chips" id="parquet-refusal-tabs"></div>
-        <div class="refusals" id="parquet-refusals"></div>
-      </div>
-    </div>
-  </section>
+  <div class="card" id="query-result" hidden>
+    <h2>What came back</h2>
+    <div class="diag" id="query-diag"></div>
+    <div id="query-output"></div>
+  </div>
 
-  <section class="result" id="cog-result">
-    <div class="result-head">
-      <h3 id="cog-title">Cloud-optimized GeoTIFF</h3>
-      <span class="meta" id="cog-meta"></span>
-    </div>
-    <div class="matrix" id="cog-matrix"></div>
-    <div class="bars" id="cog-bars"></div>
-    <div class="preview" id="cog-preview" hidden>
-      <canvas id="cog-canvas" width="128" height="128"></canvas>
-      <div id="cog-preview-note"></div>
-    </div>
-    <div class="card filtered" id="cog-filtered" hidden></div>
-    <div class="pair">
-      <div class="card">
-        <div class="lbl" id="cog-grid-label">Every tile</div>
-        <div class="grid-block" id="cog-grid"></div>
-        <p class="preset-note">Dashed outline: the licensed area. Dark outline: a tile your query asked for.</p>
-      </div>
-      <div class="card">
-        <div class="lbl">Refusals</div>
-        <div class="chips" id="cog-refusal-tabs"></div>
-        <div class="refusals" id="cog-refusals"></div>
-      </div>
-    </div>
-  </section>
+  <div class="card" id="withheld-card" hidden>
+    <h2>What the policy took out</h2>
+    <div class="facts" id="withheld-facts"></div>
+    <div id="withheld-detail"></div>
+  </div>
 
-  <section class="result" id="log-panel">
-    <div class="result-head">
-      <button type="button" class="disclosure" id="log-toggle"
-              aria-expanded="true" aria-controls="log-body">
-        <h3>Every range, in order</h3>
-      </button>
-      <span class="meta" id="log-which">nothing run yet</span>
-    </div>
-    <div id="log-body">
-      <div class="chips" id="log-tabs"></div>
-      <div class="log-scroll" id="log"></div>
-    </div>
-  </section>
+</section>
 
-  <p class="note">
-    <strong>This page enforces nothing.</strong> The policy, the principal and the
-    interception all run in your browser, and both sample files are readable with
-    <code>curl</code> straight off this origin. It visualizes a decision; it is not an
-    enforcement point. The same Rust crate compiled to a gateway would be.
-  </p>
 </main>
+
+<footer>
+  <p>The gate is a service worker: it answers the reader's range requests with
+    the bytes a gateway applying this policy would have sent. The readers are
+    unmodified and know nothing about any of this.
+    <b>It is not an access gate</b> — the sample files are public and still
+    readable with <code>curl</code>.</p>
+  <p><a href="https://github.com/alukach/cloud-native-access-control-poc">Source and findings</a></p>
+</footer>
 
 <script type="module" src="app.js"></script>
 </body>

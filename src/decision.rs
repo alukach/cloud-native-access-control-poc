@@ -691,8 +691,7 @@ mod tests {
 
     fn policy() -> Policy {
         Policy::load(
-            "allow:\n  - \"region.kind = 'metadata'\"\n  \
-             - \"region.kind = 'column_chunk' AND region.column <> 'salary'\"",
+            "(region.kind = 'metadata') OR (region.kind = 'column_chunk' AND region.column <> 'salary')",
             QUERYABLES,
         )
         .unwrap()
@@ -832,7 +831,7 @@ mod tests {
         // Not merely denied: denied even under a policy that permits every
         // region there is, because there are no regions and `all()` over the
         // empty set is `true`.
-        let permissive = Policy::load("allow:\n  - \"true\"", QUERYABLES).unwrap();
+        let permissive = Policy::load("true", QUERYABLES).unwrap();
         assert_eq!(check(&empty, &permissive, &analyst(), None), denied());
     }
 
@@ -841,7 +840,7 @@ mod tests {
     #[test]
     fn a_policy_naming_the_principal_gates_on_it() {
         let p = Policy::load(
-            "allow:\n  - \"region.kind = 'column_chunk' AND user.role = 'auditor'\"",
+            "region.kind = 'column_chunk' AND user.role = 'auditor'",
             QUERYABLES,
         )
         .unwrap();
@@ -930,7 +929,7 @@ mod tests {
     fn a_crafted_principal_is_refused() {
         let idx = index();
         let p = Policy::load(
-            "allow:\n  - \"region.kind = 'metadata' AND user.role = 'admin'\"",
+            "region.kind = 'metadata' AND user.role = 'admin'",
             QUERYABLES,
         )
         .unwrap();
@@ -1092,8 +1091,7 @@ mod tests {
     /// Metadata and the `public` column, nothing else.
     fn zf_policy() -> Policy {
         Policy::load(
-            "allow:\n  - \"region.kind = 'metadata'\"\n  \
-             - \"region.kind = 'column_chunk' AND region.column = 'public'\"",
+            "(region.kind = 'metadata') OR (region.kind = 'column_chunk' AND region.column = 'public')",
             QUERYABLES,
         )
         .unwrap()
@@ -1298,7 +1296,7 @@ mod tests {
         let idx = zf_index();
         // Column chunks are grantable, the footer is not.
         let no_metadata = Policy::load(
-            "allow:\n  - \"region.kind = 'column_chunk' AND region.column = 'public'\"",
+            "region.kind = 'column_chunk' AND region.column = 'public'",
             QUERYABLES,
         )
         .unwrap();
@@ -1340,8 +1338,7 @@ mod tests {
         // ...even under a policy that grants every classified region, which is
         // the case where an `Unmapped` blank would be most tempting.
         let permissive = Policy::load(
-            "allow:\n  - \"region.kind = 'metadata'\"\n  \
-             - \"region.kind = 'column_chunk'\"",
+            "(region.kind = 'metadata') OR (region.kind = 'column_chunk')",
             QUERYABLES,
         )
         .unwrap();
@@ -1366,22 +1363,21 @@ mod tests {
         let policies = [
             (
                 "everything",
-                Policy::load("allow:\n  - \"true\"", QUERYABLES).unwrap(),
+                Policy::load("true", QUERYABLES).unwrap(),
             ),
             (
                 "nothing",
-                Policy::load("allow:\n  - \"false\"", QUERYABLES).unwrap(),
+                Policy::load("false", QUERYABLES).unwrap(),
             ),
             ("public", zf_policy()),
             (
                 "chunks only",
-                Policy::load("allow:\n  - \"region.kind = 'column_chunk'\"", QUERYABLES).unwrap(),
+                Policy::load("region.kind = 'column_chunk'", QUERYABLES).unwrap(),
             ),
             (
                 "not salary",
                 Policy::load(
-                    "allow:\n  - \"region.kind = 'metadata'\"\n  \
-                     - \"region.kind = 'column_chunk' AND region.column <> 'salary'\"",
+                    "(region.kind = 'metadata') OR (region.kind = 'column_chunk' AND region.column <> 'salary')",
                     QUERYABLES,
                 )
                 .unwrap(),
@@ -1389,7 +1385,7 @@ mod tests {
             (
                 "auditors only",
                 Policy::load(
-                    "allow:\n  - \"region.kind = 'column_chunk' AND user.role = 'auditor'\"",
+                    "region.kind = 'column_chunk' AND user.role = 'auditor'",
                     QUERYABLES,
                 )
                 .unwrap(),
@@ -1511,7 +1507,7 @@ mod tests {
         // A zero-byte object with no header resolves to no regions, which a
         // conjunction would wave through. `ZeroFill` must not be the way in.
         let empty = LayoutIndex::new(vec![], 0);
-        let permissive = Policy::load("allow:\n  - \"true\"", QUERYABLES).unwrap();
+        let permissive = Policy::load("true", QUERYABLES).unwrap();
         assert_eq!(
             check_with_mode(&empty, &permissive, &analyst(), None, DenialMode::ZeroFill),
             refused()
@@ -1526,7 +1522,7 @@ mod tests {
     fn a_zero_fill_denial_discloses_no_more_than_any_other_denial() {
         let idx = zf_index();
         let no_metadata = Policy::load(
-            "allow:\n  - \"region.kind = 'column_chunk' AND region.column = 'public'\"",
+            "region.kind = 'column_chunk' AND region.column = 'public'",
             QUERYABLES,
         )
         .unwrap();
@@ -1623,10 +1619,7 @@ mod tests {
         // Everything but the `extra` column, which is what the measurement in
         // `DenialMode` withholds.
         let pol = Policy::load(
-            "allow:\n  - \"region.kind = 'metadata'\"\n  \
-             - \"region.kind = 'column_index'\"\n  \
-             - \"region.kind = 'bloom_filter' AND region.column <> 'extra'\"\n  \
-             - \"region.kind = 'column_chunk' AND region.column <> 'extra'\"",
+            "(region.kind = 'metadata') OR (region.kind = 'column_index') OR (region.kind = 'bloom_filter' AND region.column <> 'extra') OR (region.kind = 'column_chunk' AND region.column <> 'extra')",
             QUERYABLES,
         )
         .unwrap();

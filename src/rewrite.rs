@@ -1569,36 +1569,39 @@ mod tests {
     /// chunks, page index and bloom filter alike, which is the shape issue #26
     /// says a policy must have.
     fn policy_withholding(withheld: &[&str]) -> Policy {
-        let mut yaml = String::from("allow:\n  - \"region.kind = 'metadata'\"\n");
         let clauses: Vec<String> = withheld
             .iter()
             .map(|c| format!("region.column <> '{c}'"))
             .collect();
-        let rule = if clauses.is_empty() {
-            "region.column IS NOT NULL".to_string()
+        let columns = if clauses.is_empty() {
+            "region.kind = 'column_chunk'".to_string()
         } else {
             clauses.join(" AND ")
         };
-        yaml.push_str(&format!("  - \"{rule}\"\n"));
-        Policy::load(&yaml, QUERYABLES).expect("policy")
+        Policy::load(
+            &format!("region.kind = 'metadata' OR ({columns})"),
+            QUERYABLES,
+        )
+        .expect("policy")
     }
 
-    /// One `allow:` document from one rule per line.
+    /// One policy from several branches, OR'd and parenthesised.
     ///
-    /// Built rather than written inline because a Rust line continuation
-    /// inside a YAML string carries the indentation with it, and the parse
-    /// error that produces says nothing about the rule under test.
+    /// The parentheses are not decoration: `a OR b AND c` binds as
+    /// `a OR (b AND c)`, so joining raw strings would silently reassociate a
+    /// caller's rule.
     fn policy_from(rules: &[&str]) -> Policy {
-        let mut yaml = String::from("allow:\n");
-        for rule in rules {
-            yaml.push_str(&format!("  - \"{rule}\"\n"));
-        }
-        Policy::load(&yaml, QUERYABLES).expect("policy")
+        let joined = rules
+            .iter()
+            .map(|r| format!("({r})"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        Policy::load(&joined, QUERYABLES).expect("policy")
     }
 
     /// Permit everything, so a rewrite withholds nothing.
     fn permit_all() -> Policy {
-        Policy::load("allow:\n  - \"1 = 1\"\n", QUERYABLES).expect("policy")
+        Policy::load("1 = 1", QUERYABLES).expect("policy")
     }
 
     // ---- issue #27: policies this mode refuses --------------------------
@@ -2006,10 +2009,7 @@ mod tests {
     fn a_column_whose_bloom_filter_is_denied_is_withheld_whole() {
         let sample = Sample::load(NYC);
         let policy = Policy::load(
-            "allow:\n  - \"region.kind = 'metadata'\"\n  \
-             - \"region.kind = 'column_chunk'\"\n  \
-             - \"region.kind = 'column_index'\"\n  \
-             - \"region.kind = 'bloom_filter' AND region.column <> 'trip_distance'\"\n",
+            "(region.kind = 'metadata') OR (region.kind = 'column_chunk') OR (region.kind = 'column_index') OR (region.kind = 'bloom_filter' AND region.column <> 'trip_distance')",
             QUERYABLES,
         )
         .unwrap();
@@ -2033,8 +2033,7 @@ mod tests {
     #[test]
     fn withholding_every_column_is_refused_rather_than_served_empty() {
         let sample = Sample::load(NESTED);
-        let policy =
-            Policy::load("allow:\n  - \"region.kind = 'metadata'\"\n", QUERYABLES).unwrap();
+        let policy = Policy::load("region.kind = 'metadata'", QUERYABLES).unwrap();
         let err = plan(
             &sample.index,
             sample.footer_body(),

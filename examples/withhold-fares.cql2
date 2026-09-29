@@ -1,0 +1,25 @@
+-- The licence this gateway enforces: every column but `fare_amount` and
+-- `tip_amount`, and the structure a reader needs to find them.
+--
+-- One CQL2 expression, evaluated once per region.
+
+-- The structure. `magic`, `footer` and `footer_trailer` are the only names the
+-- Parquet resolver emits, and without them no reader can find a column at all.
+--
+-- `rewrite::plan` never asks about these; it serves the structure
+-- unconditionally, because a representation that withheld its own footer would
+-- not be a Parquet file. `--mode refuse` does ask, and the same policy has to
+-- work in both, so the comparison is honest. A policy that *denied* the
+-- structure is refused outright by `plan` rather than approximated (issue #27).
+region.kind = 'metadata'
+
+-- Every column except the two, across ALL THREE of its region kinds:
+-- `column_chunk`, `column_index` and `bloom_filter`. Writing this about
+-- `region.column` rather than about `region.kind` is what makes that work. A
+-- rule spelled `region.kind = 'column_chunk' AND region.column NOT IN (...)`
+-- permits only the chunks, and since a column is withheld if *any* of its
+-- regions is denied, it withholds every column in the file -- while looking
+-- almost right under refusal. Issue #26 is the same mistake from the other
+-- side: withholding a permitted column's bloom filter breaks DuckDB equality
+-- predicates with a corruption-shaped error.
+OR (region.column <> 'fare_amount' AND region.column <> 'tip_amount')

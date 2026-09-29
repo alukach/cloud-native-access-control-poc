@@ -1714,7 +1714,7 @@ mod tests {
         assert_eq!(unmapped_bytes(&idx), size);
 
         let permissive = Policy::load(
-            "allow:\n  - \"region.kind = 'tile'\"\n  - \"region.kind = 'metadata'\"",
+            "(region.kind = 'tile') OR (region.kind = 'metadata')",
             QUERYABLES,
         )
         .unwrap();
@@ -1797,11 +1797,7 @@ mod tests {
 
         // The property that matters: a reader fetching the metadata prefix in
         // one range is no longer denied by a single byte inside it.
-        let policy = Policy::load(
-            "allow:\n  - \"region.kind = 'metadata'\"",
-            crate::policy::QUERYABLES,
-        )
-        .unwrap();
+        let policy = Policy::load("region.kind = 'metadata'", crate::policy::QUERYABLES).unwrap();
         let user = json!({});
         assert!(idx
             .try_resolve(&(0..1828))
@@ -2352,7 +2348,7 @@ mod tests {
         let bytes = read("data/s2-tci-512.tif");
         let idx = index(&bytes);
         let policy = Policy::load(
-            "allow:\n  - \"region.kind = 'tile' AND region.overview_level >= 2\"",
+            "region.kind = 'tile' AND region.overview_level >= 2",
             QUERYABLES,
         )
         .unwrap();
@@ -2401,7 +2397,7 @@ mod tests {
         let bytes = read("data/s2-tci-512.tif");
         let idx = index(&bytes);
         let policy = Policy::load(
-            "allow:\n  - \"region.kind = 'tile' AND region.overview_level >= 2\"",
+            "region.kind = 'tile' AND region.overview_level >= 2",
             QUERYABLES,
         )
         .unwrap();

@@ -57,21 +57,38 @@ per object and cached.
 
 **Decide** — evaluate a CQL2 filter against every overlapped region.
 
-```yaml
-# role: licensee
-allow:
-  - "region.kind = 'metadata'"
-  - "region.kind = 'column_chunk' AND region.column NOT IN ('salary','ssn')"
-  - "region.kind = 'tile' AND region.overview_level >= 2"
-  - "user.role = 'licensee' AND region.kind = 'tile' AND S_CONTAINS(POLYGON((...)), region.geom)"
+A policy is **one CQL2 expression**, evaluated once per region:
+
+```sql
+-- role: licensee
+   (region.kind = 'metadata')
+OR (region.column NOT IN ('salary', 'ssn'))
+OR (region.kind = 'tile' AND region.overview_level >= 2)
+OR (user.role = 'licensee'
+    AND region.kind = 'tile'
+    AND S_CONTAINS(POLYGON((...)), region.geom))
 ```
 
 Those last two are the case worth demonstrating: anyone may browse overviews,
 full resolution only inside a licensed area.
 
-The argument order in that last rule is load-bearing. **`S_CONTAINS(<area>,
-region.geom)`, never `S_INTERSECTS(region.geom, <area>)`** — see
-[Why the spatial predicate is the rule](#why-the-spatial-predicate-is-the-rule).
+Two things in there are load-bearing and both are easy to get wrong.
+
+**Guard each branch on `region.kind` first.** A region carries only the
+properties its kind has — a tile has `overview_level` and no `column`, a column
+chunk the reverse — and naming a property a region lacks leaves the comparison
+unresolved, which denies. `AND` short-circuits on a false kind check, so a
+guarded branch never reaches the missing property. Written without the guards,
+`region.overview_level > 0 OR region.column <> 'salary'` fails to reduce for
+*every* region and grants nothing. That is fail-closed, and visible at once.
+
+**`S_CONTAINS(<area>, region.geom)`, never `S_INTERSECTS(region.geom, <area>)`**
+— see [Why the spatial predicate is the rule](#why-the-spatial-predicate-is-the-rule).
+
+Note also the second rule names the **column**, not a region kind. A column owns
+`column_chunk`, `column_index` and `bloom_filter` regions and a rule has to
+permit all three; spelled `region.kind = 'column_chunk' AND region.column NOT IN
+(...)` it withholds every column in the file while looking almost right.
 
 CQL2 because the audience already writes it against STAC, and because
 [cql2-rs](https://github.com/developmentseed/cql2-rs) evaluates it in-process
@@ -194,7 +211,7 @@ every edge. Snap it outward to the union of tiles it overlaps and the two
 spellings serve identical bytes — but now the polygon in the policy *states*
 the ground being served, instead of the predicate quietly widening it. The
 over-grant is not removed; it is moved somewhere a licensor can read it. That
-is what `examples/withhold-tiles.yaml` and the demo's presets both do.
+is what `examples/withhold-tiles.cql2` and the demo's presets both do.
 
 Pinned by `s_intersects_grants_tiles_outside_the_area_and_s_contains_does_not`
 in `src/cog.rs`. Note that this reasoning is specific to raster tiles; for
@@ -328,7 +345,7 @@ Worth reading by name, since each pins a bug that would otherwise have shipped:
 ```sh
 cargo run --release --example gate -- \
     --file data/nyc-taxi-8rg.parquet \
-    --policy examples/withhold-fares.yaml \
+    --policy examples/withhold-fares.cql2 \
     --user '{"role":"analyst"}' \
     --port 8899 --mode scrub        # or: rewrite, refuse
 ```

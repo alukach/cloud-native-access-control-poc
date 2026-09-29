@@ -3,7 +3,7 @@
 //! ```text
 //! cargo run --release --example gate -- \
 //!     --file data/nyc-taxi-8rg.parquet \
-//!     --policy examples/withhold-fares.yaml \
+//!     --policy examples/withhold-fares.cql2 \
 //!     --user '{"role":"analyst"}' \
 //!     --port 8899 [--mode scrub|rewrite|refuse]
 //! ```
@@ -77,7 +77,7 @@ struct Gate {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut path = "data/nyc-taxi-8rg.parquet".to_string();
-    let mut policy_path = "examples/withhold-fares.yaml".to_string();
+    let mut policy_path = "examples/withhold-fares.cql2".to_string();
     let mut user_json = r#"{"role":"analyst"}"#.to_string();
     let mut port = 8899u16;
     let mut mode = Mode::Scrub;
