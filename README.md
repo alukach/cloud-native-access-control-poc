@@ -403,6 +403,21 @@ real deployments fail:
 The gate is a **service worker**, which needs a secure context: `localhost`
 counts, a bare LAN IP does not.
 
+Three samples, each showing something the others cannot:
+
+| sample | what it is for |
+| --- | --- |
+| **Paris — landmarks** | 11 MB, 0.4 m. Withhold the Eiffel Tower and you can see exactly what left. |
+| **NYC taxi trips** | 8 MB Parquet. Real SQL through the gate; a withheld column is a binder error, not nulls. |
+| **CONUS fire hazard** | **9.05 GB**, BigTIFF, 86,190 regions read from ~1 MB of metadata. Hide Colorado. Nothing ever downloads the object. |
+
+The last one is the claim of this whole project at a size where it means
+something — and it is slow on purpose rather than by accident: planning a
+filtered view evaluates the policy against all 86,190 regions, which takes
+seconds. See [Is it unrealistic to subset tiles by CQL2?](#) — the cost is
+linear in regions × polygon vertices, and the fix is a planner this repository
+does not have.
+
 `serve.json` sets `Cache-Control: no-store`. Without it the browser runs
 whichever modules it cached, which looks exactly like the page being broken.
 

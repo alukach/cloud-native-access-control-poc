@@ -39,12 +39,19 @@ export const SAMPLES = [
       + 'more than one column chunk, which is where every interesting problem starts.',
   },
   {
-    id: 's2-tci',
+    id: 'conus-fire',
     format: 'cog',
-    name: 'Sentinel-2 granule',
-    path: `${SOURCE_COOP}/s2-tci-512.tif`,
-    blurb: '5 MB, 6 overview levels, 655 tiles at 10 m. The licensing case rather than '
-      + 'the redaction one: an area is granted, not withheld.',
+    name: 'CONUS fire hazard',
+    // Not a copy: this is the publisher's own object, read where it lives.
+    path: 'https://data.source.coop/wildland-almanac/conus/v2026.1/'
+      + 'Fire_FL/WildlandAlmanac_CONUS_Fire_FL_2024.tif',
+    blurb: '9.05 GB, 160,000 × 105,000 at 30 m, BigTIFF, 10 overview levels — 86,190 '
+      + 'regions indexed from about a megabyte of metadata. Nothing else is ever '
+      + 'fetched, which is the entire claim of this project at a size where it means '
+      + 'something.',
+    attribution: 'Wildland Almanac — CC BY 4.0',
+    /** Planning a filtered view of 86,190 regions takes a few seconds. */
+    slow: true,
   },
 ];
 
@@ -143,6 +150,23 @@ export const LANDMARKS = [
 const outside = (areas) =>
   areas.map((a) => `NOT S_INTERSECTS(region.geom, ${ring(a.bbox)})`).join('\n     AND ');
 
+/**
+ * Colorado, in EPSG:5070 (NAD83 / Conus Albers) — the CONUS file's own CRS.
+ *
+ * Colorado is a rectangle in latitude and longitude and is NOT one in Albers:
+ * the parallels curve. So the ring samples each edge rather than using four
+ * corners, and it is written in metres because a polygon in degrees would
+ * match nothing here and deny everything — a policy that looks like it works
+ * and protects the whole country instead (issue #5).
+ *
+ * Thirteen points rather than forty-nine. Measured against the real object,
+ * the finer ring withholds 1,672 tiles and this one 1,676 — a difference of
+ * four tiles in sixteen hundred — while costing half as much to evaluate,
+ * because a spatial predicate's cost is linear in vertex count and this runs
+ * once per region.
+ */
+const COLORADO = 'POLYGON((-1146446 1629565,-942232 1603908,-737448 1583274,-532219 1567678,-522727 1716806,-513234 1865944,-503746 2015007,-697994 2029769,-891822 2049299,-1085111 2073583,-1105550 1925623,-1125999 1777589,-1146446 1629565))';
+
 export const POLICIES = {
   paris: [
     {
@@ -213,24 +237,55 @@ export const POLICIES = {
       build: () => doc(["region.kind IN ('column_chunk', 'column_index', 'bloom_filter', 'column_metadata')"]),
     },
   ],
-  cog: [
+  'conus-fire': [
     {
-      id: 'licensed-area',
-      name: 'Overviews public, full resolution licensed',
-      blurb: 'The imagery licence. Anyone may browse the overviews; full resolution '
-        + 'only inside the licensed area.',
-      area: 'coast',
-      build: (ctx) => doc([STRUCTURE, 'region.overview_level > 0', inside(ring(ctx.bbox))]),
+      id: 'hide-colorado-detail',
+      name: 'Hide Colorado at high detail',
+      blurb: 'The state withheld at full resolution, every overview published. Zoom in '
+        + 'over Colorado and the tiles are gone; zoom out and it is still there, '
+        + 'coarsely — the same trade the Paris policies make, and the only version of '
+        + 'this that a browser can render, because withholding the coarsest tile takes '
+        + 'the whole country with it.',
+      build: () => doc([
+        STRUCTURE,
+        'region.overview_level > 0',
+        `region.overview_level = 0\n     AND NOT S_INTERSECTS(region.geom, ${COLORADO})`,
+      ]),
     },
+    {
+      id: 'hide-colorado',
+      name: 'Hide Colorado',
+      blurb: 'Every tile overlapping the state, at all ten overview levels: 1,676 tiles '
+        + 'and 353 MB blanked, of an object nothing ever downloads. The map cannot '
+        + 'render this — one tile at the coarsest level covers the whole country, so '
+        + 'withholding Colorado withholds it, and geotiff.js throws on a sparse tile '
+        + 'rather than skipping it (issue #31). The summary below is still exact; that '
+        + 'gap between what was withheld and what a reader can show is the finding, '
+        + 'not a bug in the policy.',
+      build: () => doc([
+        STRUCTURE,
+        `region.kind = 'tile'\n     AND NOT S_INTERSECTS(region.geom, ${COLORADO})`,
+      ]),
+    },
+    {
+      id: 'open',
+      name: 'Publish everything',
+      blurb: 'The baseline, and much faster to plan: with no spatial clause there is no '
+        + 'geometry to evaluate per region.',
+      build: () => doc([STRUCTURE, "region.kind = 'tile'"]),
+    },
+  ],
+  cog: [
     {
       id: 'overviews-only',
       name: 'Overviews only',
-      blurb: 'Browse resolution for everyone, full resolution for nobody.',
+      blurb: 'Browse resolution for everyone, full resolution for nobody. Names no '
+        + 'coordinates, so it means the same thing for any COG.',
       build: () => doc([STRUCTURE, 'region.overview_level > 0']),
     },
     {
       id: 'open',
-      name: 'Allow everything',
+      name: 'Publish everything',
       blurb: 'The baseline.',
       build: () => doc([STRUCTURE, "region.kind = 'tile'"]),
     },
@@ -238,8 +293,8 @@ export const POLICIES = {
       id: 'naive-overviews',
       name: 'Overviews only, written naively',
       blurb: 'One rule, exactly as you would first write it. It serves nothing: the '
-        + 'IFDs and tag arrays that locate the tiles are metadata, and this '
-        + 'permits neither.',
+        + 'IFDs and tag arrays that locate the tiles are metadata, and this permits '
+        + 'neither.',
       build: () => doc(['region.overview_level > 0']),
     },
   ],

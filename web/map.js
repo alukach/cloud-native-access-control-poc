@@ -53,7 +53,39 @@ export async function mountMap(container, { url, onStatus }) {
   let images = [];
   let width = 0;
   let height = 0;
+  let bands = 3;
   let generation = 0;
+  /**
+   * A single-band raster, as something a screen can show.
+   *
+   * Continental datasets are usually one band of measurements rather than
+   * three of colour, so `readRGB` has nothing to work with. The ramp is dark
+   * red through orange to pale yellow, which reads as intensity without
+   * implying categories the data does not have, and `nodata` stays dark rather
+   * than being painted as a low value -- absent and zero are different, and a
+   * ramp that conflated them would be inventing coverage.
+   */
+  function ramp(rasters) {
+    const band = rasters[0];
+    const out = new Uint8ClampedArray(band.length * 3);
+    for (let i = 0, p = 0; i < band.length; i += 1, p += 3) {
+      const v = band[i];
+      if (v <= 0 || v < -1000) {
+        out[p] = 12;
+        out[p + 1] = 12;
+        out[p + 2] = 16;
+        continue;
+      }
+      // Clamped well below the maximum: the distribution has a long thin tail
+      // and scaling to it would leave the country almost black.
+      const t = Math.min(1, v / 500);
+      out[p] = Math.round(40 + 215 * Math.min(1, t * 1.8));
+      out[p + 1] = Math.round(Math.max(0, t - 0.25) * 320);
+      out[p + 2] = Math.round(Math.max(0, t - 0.7) * 500);
+    }
+    return out;
+  }
+
   /** How many tiles this reader refused to decode, for the status line. */
   let undecodable = 0;
 
@@ -62,12 +94,24 @@ export async function mountMap(container, { url, onStatus }) {
     undecodable = 0;
     tiff = await fromUrl(nextUrl);
     const count = await tiff.getImageCount();
-    images = [];
-    for (let i = 0; i < count; i += 1) images.push(await tiff.getImage(i));
-    // geotiff.js orders images fine-to-coarse, which is also the COG's order.
-    width = images[0].getWidth();
-    height = images[0].getHeight();
+    // Lazily. On a continental COG each overview's tag arrays are large --
+    // level 0 of the CONUS file has 64,478 tile offsets and as many byte
+    // counts, about 750 kB between them -- and geotiff.js reads an image's
+    // arrays in full when it is opened. Asking for all ten up front meant a
+    // megabyte of tag arrays per level before a single pixel was drawn, which
+    // looked like a hang. A view only ever needs the level it is showing.
+    images = new Array(count).fill(null);
+    const first = await imageAt(0);
+    width = first.getWidth();
+    height = first.getHeight();
+    bands = first.getSamplesPerPixel();
     onStatus?.(`${width}×${height}, ${count} levels`);
+  }
+
+  /** One overview, opened on first use and kept. */
+  async function imageAt(level) {
+    if (!images[level]) images[level] = await tiff.getImage(level);
+    return images[level];
   }
 
   await openTiff(url);
@@ -118,13 +162,14 @@ export async function mountMap(container, { url, onStatus }) {
     // One output pixel per 256 across the full cell; pick the coarsest image
     // that still has that detail, so a zoomed-out view reads small tiles
     // rather than decimating the full-resolution ones.
+    // Choose the level from the requested scale rather than by measuring every
+    // image, which would mean opening all of them. A COG's overviews halve at
+    // each step, so the level is the log2 of how much detail is being thrown
+    // away -- and the exact scale is read back from the image once it is open,
+    // so a pyramid that is not exactly power-of-two still lands correctly.
     const wanted = (bbox.right - bbox.left) / 256;
-    let level = 0;
-    for (let i = 0; i < images.length; i += 1) {
-      const scale = width / images[i].getWidth();
-      if (scale <= wanted) level = i;
-    }
-    const image = images[level];
+    const level = Math.max(0, Math.min(images.length - 1, Math.floor(Math.log2(Math.max(1, wanted)))));
+    const image = await imageAt(level);
     const scale = width / image.getWidth();
 
     const window = [
@@ -142,7 +187,9 @@ export async function mountMap(container, { url, onStatus }) {
 
     let rgb;
     try {
-      rgb = await image.readRGB({ window, width: outW, height: outH, signal });
+      rgb = bands >= 3
+        ? await image.readRGB({ window, width: outW, height: outH, signal })
+        : ramp(await image.readRasters({ window, width: outW, height: outH, signal }));
     } catch (err) {
       // geotiff.js cannot read a sparse tile. `TileOffsets[i] == 0` means "never
       // written" and GDAL fills it with nodata; geotiff.js dereferences the
@@ -182,7 +229,12 @@ export async function mountMap(container, { url, onStatus }) {
     id: `cog-${generation}`,
     tileSize: 256,
     extent: [0, 0, width, height],
-    minZoom: -6,
+    // Derived from the image, not fixed. A hard `minZoom: -6` silently
+    // requests NO tiles for anything bigger than about 16k pixels, because
+    // fitting it puts the view below that floor -- a 160,000-pixel CONUS
+    // raster fits at about -8 and drew nothing at all, while Paris at -3.8
+    // was fine. The floor is one step below whatever the coarsest level needs.
+    minZoom: Math.floor(Math.log2(256 / Math.max(width, height))) - 1,
     maxZoom: 0,
     maxRequests: 8,
     refinementStrategy: 'no-overlap',

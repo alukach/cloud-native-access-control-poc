@@ -542,7 +542,14 @@ async function runQuery() {
   diag.className = 'diag';
   diag.textContent = '';
   output.textContent = '';
-  busy.textContent = 'opening the gate…';
+  // A filtered view of a large object is planned by evaluating the policy
+  // against every region, so it is seconds rather than milliseconds and the
+  // page should say so rather than appearing hung.
+  const sample = state.url ? null : sampleById(state.sample);
+  busy.textContent = sample?.slow && state.mode === 'filter'
+    ? `planning a filtered view of ${state.file.regionCount.toLocaleString()} regions — `
+      + 'this takes a few seconds…'
+    : 'opening the gate…';
 
   try {
     const gate = await openGate();
