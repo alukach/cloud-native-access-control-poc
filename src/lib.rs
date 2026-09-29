@@ -1,6 +1,7 @@
 pub mod cog;
 pub mod decision;
 pub mod index;
+pub mod origin;
 pub mod parquet;
 pub mod policy;
 pub mod range;

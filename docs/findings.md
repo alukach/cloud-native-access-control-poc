@@ -252,6 +252,11 @@ about how the input gets used?
   origin to ignore a range unit it does not understand and return `200` with the
   entire representation, so any parser disagreement is a full-object disclosure.
   Send the canonical range and verify `Content-Range` on the response.
+  `src/origin.rs::verify` is that check, and it was prose in this document for
+  longer than it should have been — the single most load-bearing rule in the
+  design had no implementation and no test until it was written down as code.
+  Whatever adopts this crate should call it on every response, including the
+  ones it is sure about.
 - **A CDN can strip ranges entirely.** Found while deploying this repository's
   own demo. Same RFC clause, arriving as an infrastructure problem.
 - **Write a spatial rule as `S_CONTAINS(<area>, region.geom)`, never
@@ -271,7 +276,7 @@ about how the input gets used?
 ## 8. Reproducing this
 
 ```sh
-cargo test                                    # 209 tests
+cargo test                                    # 225 tests
 cargo run --example gate -- --help            # the rewrite+scrub gateway
 ./scripts/make-fixtures.sh verify             # re-measure the sample files
 ```

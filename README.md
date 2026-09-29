@@ -15,7 +15,7 @@ Parquet, COG, Zarr and Icechunk — enforced at an S3 gateway, using
 > scrubbed — works for every client measured, because its correctness does not
 > depend on how a client batches reads.
 >
-> 209 tests, two runnable gateways (`examples/gate.rs`, `examples/cog_gate.rs`),
+> 225 tests, two runnable gateways (`examples/gate.rs`, `examples/cog_gate.rs`),
 > and a browser demo. Not production software; it exists to decide whether
 > [multistore](https://github.com/developmentseed/multistore) should adopt the
 > approach. Background:
@@ -117,6 +117,28 @@ The consequence: **authorization must be verified against the response, not
 just the request.** The gateway sends its own canonical range, never the
 client's header, and rejects any response whose `Content-Range` isn't what it
 authorized.
+
+That rule is `src/origin.rs` — [`verify`], a pure function over the response
+fields, with no socket and no HTTP library, because a gateway adopting this
+crate already has one and the choice is not ours. What it cannot be trusted to
+have is the rule. It refuses a `200` for a partial authorization, a `206`
+naming any other extent, a complete-length that disagrees with the layout, a
+rotated `ETag`, a short body, and a `Content-Range` it will not interpret —
+each as a distinct error, because an operator wants `RangeIgnored` in the log
+loudly: it means the backend and this crate disagree about range syntax and
+every other request is suspect too.
+
+One of its tests is not a model. `a_real_origin_that_ignores_range_is_caught_by_verify`
+starts `python3 -m http.server`, asks it for 1,000 bytes with `curl`, and
+observes `200` with all 8,422,357 — then feeds that real response to `verify`
+and asserts it is refused. It is `#[ignore]`d, since it needs python3 and a
+free port:
+
+```sh
+cargo test -- --ignored a_real_origin_that_ignores_range
+```
+
+[`verify`]: src/origin.rs
 
 **Default-deny over an empty set allows everything.** If a byte belongs to no
 known region — Parquet's `PAR1` magic, inter-chunk padding, the page index, or
@@ -273,7 +295,7 @@ and `rustup` installs it automatically). For the browser demo you also need
 ### The crate
 
 ```sh
-cargo test          # 209 tests; the test names are the specification
+cargo test          # 225 tests; the test names are the specification
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -297,6 +319,7 @@ Worth reading by name, since each pins a bug that would otherwise have shipped:
 | `the_word_alignment_pad_after_an_odd_length_tag_value_is_not_unmapped` | one byte that denied every Sentinel-2 COG header read |
 | `withholding_a_groups_only_leaf_prunes_the_group_rather_than_emptying_it` | `num_children=0` silently reshapes the schema |
 | `s_intersects_grants_tiles_outside_the_area_and_s_contains_does_not` | 49 tiles served where 25 were licensed |
+| `a_200_with_the_whole_object_is_refused_not_relayed` | the RFC 9110 §14.2 full-object disclosure |
 
 ### The gateway
 
@@ -420,7 +443,9 @@ cannot occur. Do not substitute an arbitrary `TCI.tif`.
 
 ```
 src/              Rust: range parsing, layout index, policy, decision, resolvers,
-                  and rewrite.rs (footer rewrite + scrub)
+                  rewrite.rs (footer rewrite + scrub), sparse.rs (the COG
+                  analogue), and origin.rs (verifying the backend's response
+                  against what was authorized)
 examples/         gate.rs, an HTTP gateway serving a filtered view of a file
 web/              static demo for GitHub Pages (web/pkg/ is built, gitignored)
 data/             sample Parquet and COG, sized so coalescing actually bites
