@@ -547,14 +547,9 @@ mod tests {
     use super::*;
     use crate::cog::build_index_with_layout;
     use crate::decision::{check, Decision, DenialMode};
-    use std::path::PathBuf;
-
-    fn repo(rel: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
-    }
 
     fn read(rel: &str) -> Vec<u8> {
-        std::fs::read(repo(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+        crate::testdata::read(rel)
     }
 
     fn parse(rel: &str) -> (Vec<u8>, LayoutIndex, CogLayout) {

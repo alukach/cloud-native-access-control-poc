@@ -318,9 +318,23 @@ and `rustup` installs it automatically). For the browser demo you also need
 ### The crate
 
 ```sh
-cargo test          # 235 tests; the test names are the specification
+./scripts/fetch-data.sh    # the samples are hosted, not committed
+cargo test                 # 236 tests; the test names are the specification
 cargo clippy --all-targets -- -D warnings
 ```
+
+The sample files are **not in the repository** — 24 MB of binaries that never
+change, and the demo needs them on a host that serves byte ranges with CORS
+anyway, so there is one copy and everything reads it. `fetch-data.sh` pulls
+them from
+[Source Cooperative](https://data.source.coop/alukach/alukach-experimentation/cloud-native-access-control/)
+and verifies a pinned SHA-256 for each. That check is not ceremony: the numbers
+throughout `docs/findings.md` are properties of those exact bytes, and a sample
+that changed silently would invalidate them without a single test failing.
+
+`tests/fixtures/` **is** committed. Those files are small and each one pins a
+specific parse failure, so a checkout that could not reproduce them could not
+run the suite at all.
 
 The tests are the most honest picture of what this does. They run against the
 real sample files in `data/` and the adversarial fixtures in `tests/fixtures/`,

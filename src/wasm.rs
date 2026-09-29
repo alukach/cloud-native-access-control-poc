@@ -1607,8 +1607,7 @@ mod tests {
     // opposite ends.
     #[test]
     fn a_window_too_small_reports_how_many_bytes_would_do() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let parquet = std::fs::read(root.join("data/nyc-taxi-8rg.parquet")).unwrap();
+        let parquet = crate::testdata::read("data/nyc-taxi-8rg.parquet");
         let size = parquet.len() as u64;
         // The last 8 bytes are the trailer, which declares a footer far longer
         // than that, so this is the retry case rather than a corrupt file.
@@ -1619,7 +1618,7 @@ mod tests {
         let start = (size - needed) as usize;
         assert!(build_index(Format::Parquet, &parquet[start..], size).is_ok());
 
-        let cog = std::fs::read(root.join("data/s2-tci-512.tif")).unwrap();
+        let cog = crate::testdata::read("data/s2-tci-512.tif");
         let size = cog.len() as u64;
         let err = build_index(Format::Cog, &cog[..8], size).unwrap_err();
         let needed = err.needed.expect("a truncated prefix must say how much");
@@ -1660,8 +1659,7 @@ mod tests {
     // requests, and the answers do not depend on how many came before.
     #[test]
     fn a_held_index_decides_repeatedly_and_identically() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let bytes = std::fs::read(root.join("data/nyc-taxi-8rg.parquet")).unwrap();
+        let bytes = crate::testdata::read("data/nyc-taxi-8rg.parquet");
         let size = bytes.len() as u64;
         let (idx, _) = build_index(Format::Parquet, &bytes, size).unwrap();
         let pol = policy();
@@ -1684,8 +1682,7 @@ mod tests {
     const WINDOW: usize = 16 * 1024;
 
     fn sample(rel: &str) -> Vec<u8> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        std::fs::read(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+        crate::testdata::read(rel)
     }
 
     fn withholding(columns: &[&str]) -> Policy {

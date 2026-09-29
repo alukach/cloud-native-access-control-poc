@@ -7,6 +7,8 @@ pub mod policy;
 pub mod range;
 pub mod rewrite;
 pub mod sparse;
+#[cfg(test)]
+pub(crate) mod testdata;
 pub mod wasm;
 
 pub fn version() -> &'static str {

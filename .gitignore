@@ -5,3 +5,11 @@
 
 # Built design canvas; re-seed from design/*.dc.html instead.
 design/access-control-demo-ui.html
+
+# The sample files are hosted, not committed: 24 MB of binaries that never
+# change, and the demo needs them on a range-serving host anyway, so there is
+# one copy and everything reads it. `./scripts/fetch-data.sh` puts them here.
+# `tests/fixtures/` is different and IS committed -- small files, each pinning
+# a specific parse failure.
+data/*.tif
+data/*.parquet

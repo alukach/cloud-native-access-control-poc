@@ -22,6 +22,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The samples are hosted, not committed. Fetching them is not optional:
+      # every test that reads a real file would otherwise fail, and the whole
+      # point of those tests is that they run against artefacts other tools
+      # produced rather than against synthetic bytes. The script verifies a
+      # pinned SHA-256, so a sample that changed upstream fails here rather
+      # than quietly invalidating the numbers in docs/findings.md.
+      - name: Fetch sample data
+        run: ./scripts/fetch-data.sh
+
       - name: Format
         run: cargo fmt --check
 

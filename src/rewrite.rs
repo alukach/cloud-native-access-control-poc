@@ -1522,7 +1522,7 @@ mod tests {
 
     impl Sample {
         fn load(path: &str) -> Self {
-            let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let bytes = crate::testdata::read(path);
             let size = bytes.len() as u64;
             let index = crate::parquet::build_index(&bytes, size).expect("build_index");
             Sample { bytes, index }

@@ -469,7 +469,7 @@ mod tests {
     use crate::index::{Region, RegionKind};
     use crate::policy::{Policy, QUERYABLES};
     use serde_json::json;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     // `::parquet` and not `parquet`: this module IS `crate::parquet`, so a bare
     // path would be ambiguous between it and the crate of the same name.
@@ -486,11 +486,11 @@ mod tests {
     // ---- fixtures ----------------------------------------------------------
 
     fn repo(rel: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+        crate::testdata::repo(rel)
     }
 
     fn read(rel: &str) -> Vec<u8> {
-        std::fs::read(repo(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+        crate::testdata::read(rel)
     }
 
     /// Every Parquet file committed to this repository, found by walking the

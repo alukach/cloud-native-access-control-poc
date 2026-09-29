@@ -1605,8 +1605,7 @@ mod tests {
     // would silently take zero-fill back to refusing.
     #[test]
     fn zero_fill_serves_the_aligned_block_reads_refuse_cannot() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let bytes = std::fs::read(root.join("data/nyc-taxi-8rg.parquet")).unwrap();
+        let bytes = crate::testdata::read("data/nyc-taxi-8rg.parquet");
         let size = bytes.len() as u64;
         let idx = crate::parquet::build_index(&bytes, size).unwrap();
         assert!(
