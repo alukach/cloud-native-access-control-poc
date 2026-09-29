@@ -226,9 +226,55 @@ rewritten too.
   a new seam in multistore. It also found that multistore forwards the client's
   `Range` header verbatim (`proxy.rs:916`) — harmless while it makes no
   sub-object decision, and the §14.2 bypass on the day it does.
-- **Breadth.** One Parquet file, one codec, one flat schema; one COG. Untested:
-  nested and repeated types, v2 data pages, encrypted files, hive datasets,
-  BigTIFF, and every engine other than the five measured.
+- **Breadth.** One Parquet file, one codec, one flat schema; two COGs. Untested:
+  nested and repeated types, v2 data pages, encrypted files, hive datasets, and
+  every engine other than the five measured. BigTIFF is no longer on that list
+  — see below.
+
+## 5b. BigTIFF, and why it was never an edge case
+
+`docs/findings.md` used to list BigTIFF under "untested breadth", beside v2 data
+pages and encrypted files. That was wrong about its importance, and finding out
+why is the useful part.
+
+Any COG over 4 GB **must** be BigTIFF — classic TIFF offsets are 32-bit. But
+the constraint is far wider in practice: writers producing large collections
+pass `BIGTIFF=YES` once and stop thinking about it. Every file in the Wildland
+Almanac CONUS collection on Source Cooperative is version 43, **including the
+1.6 GB ones**. Size is not a usable filter, so "we support classic TIFF" meant
+"we cannot be pointed at the objects this design is for".
+
+It is also not a large change, which is the other half of the finding. BigTIFF
+is the same format with every offset and count widened: a 16-byte header
+carrying an explicit offset size, a u64 entry count, 20-byte entries rather than
+12, a u64 next-IFD pointer, and an 8-byte inline-value threshold rather than 4.
+Tags and their meanings are identical. Threading one descriptor through the
+scan was the whole of it.
+
+Two things it surfaced that a synthetic fixture would not have:
+
+- **The two tile arrays of one image can have different element widths.** GDAL
+  writes `TileOffsets` as LONG8 and `TileByteCounts` as LONG in the same file.
+  Anything assuming a single width for both passes on a classic TIFF and
+  corrupts a BigTIFF. `TileArray` was already per-array, so this cost nothing —
+  but only by luck.
+- **The header is 16 bytes, not 8**, and a GDAL ghost area begins immediately
+  after it. Getting that wrong leaves exactly 8 unclassified bytes, which the
+  coverage invariant caught.
+
+Measured on `WildlandAlmanac_CONUS_Fire_FL_2024.tif` — 9.05 GB, 160000 × 105000
+at 30 m, EPSG:5070, 512² blocks:
+
+| | |
+| --- | --- |
+| regions | 86,190 across 10 overview levels |
+| level-0 tiles | 64,478 |
+| unmapped bytes | **0** |
+| metadata read | 1,039,072 bytes, in 3 round trips |
+
+That last row is the claim this whole project rests on, finally demonstrated at
+a size where it means something: **a megabyte of metadata describes nine
+gigabytes of object, and nothing else is ever fetched.**
 
 ## 6. A pattern worth naming
 

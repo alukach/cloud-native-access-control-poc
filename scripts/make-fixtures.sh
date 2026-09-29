@@ -338,6 +338,23 @@ make_tiff_fixtures() {
   gdal_translate -q -of COG "${SRCWIN[@]}" \
     -co BLOCKSIZE=64 -co COMPRESS=JPEG -co QUALITY=75 -co OVERVIEWS=IGNORE_EXISTING \
     "$src" "$FIX/tiny-cog.tif"
+
+  # bigtiff.tif -- version 43, small. BigTIFF is not a large-file edge case:
+  # writers producing large collections pass BIGTIFF=YES once and every file in
+  # the collection is version 43 regardless of size. Every object in the
+  # Wildland Almanac CONUS repository is, including the 1.6 GB ones, so a
+  # resolver that cannot read one cannot be pointed at real data.
+  #
+  # The properties worth having in a fixture, none of which a synthetic file
+  # would give: a 16-byte header (not 8) with a GDAL ghost area immediately
+  # after it, a u64 entry count, 20-byte IFD entries, and -- the one that
+  # actually bites -- TileOffsets written as LONG8 while TileByteCounts stays
+  # LONG, so the two arrays of one image have DIFFERENT element widths.
+  gdal_translate -q -of GTiff -outsize 512 512 \
+    -co BIGTIFF=YES -co TILED=YES -co BLOCKXSIZE=256 -co BLOCKYSIZE=256 \
+    -co COMPRESS=DEFLATE -co PREDICTOR=2 \
+    "$DATA/s2-tci-512.tif" "$FIX/bigtiff.tif"
+  gdaladdo -q -r average "$FIX/bigtiff.tif" 2
 }
 
 # ---------------------------------------------------------------------------

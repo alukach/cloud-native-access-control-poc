@@ -195,7 +195,12 @@ use tiff::decoder::Decoder;
 use tiff::tags::{IfdPointer, Tag};
 
 /// `II`/`MM`, the version, and the offset of the first IFD.
+///
+/// A BigTIFF header is twice as long: the version is followed by an offset size
+/// and a reserved u16 before the first-IFD pointer, which is itself a u64. See
+/// [`Tiff::header_len`].
 const HEADER_LEN: u64 = 8;
+const BIG_HEADER_LEN: u64 = 16;
 /// The first bytes of a GDAL ghost area, immediately after the header.
 const GHOST_MARKER: &[u8] = b"GDAL_STRUCTURAL_METADATA_SIZE=";
 /// What follows the decimal size in the ghost area's first line.
@@ -259,12 +264,10 @@ pub enum CogError {
     /// a caller that keeps widening its read terminates.
     #[error("metadata needs the first {needed} bytes of the object")]
     Truncated { needed: u64 },
-    /// No `II`/`MM`, or a version that is not 42.
+    /// No `II`/`MM`, a version that is neither 42 nor 43, or a BigTIFF header
+    /// that disagrees with the specification about its own offset width.
     #[error("not a TIFF: {0}")]
     NotTiff(String),
-    /// Version 43. Out of scope; see rule 9 and issue #6.
-    #[error("BigTIFF (version 43) is not supported")]
-    BigTiff,
     /// Rule 4: band-major tiles, which region props cannot express.
     #[error("PlanarConfiguration = {planar} stores tiles band-major")]
     PlanarBandMajor { planar: u64 },
@@ -403,19 +406,53 @@ pub fn build_index_with_layout(
             )))
         }
     };
-    match read_u16(bytes, 2, big_endian) {
-        Some(42) => {}
-        // Rule 9. Detected before anything else is believed, because a
-        // BigTIFF's 8-byte offsets would all be misread from here on.
-        Some(43) => return Err(CogError::BigTiff),
-        other => return Err(CogError::NotTiff(format!("version {other:?}, not 42"))),
-    }
-    let first_ifd = read_u32(bytes, 4, big_endian)
-        .map(u64::from)
+    // The version decides every offset width from here on, so it is read
+    // before anything else is believed.
+    let tiff = match read_u16(bytes, 2, big_endian) {
+        Some(42) => Tiff {
+            big_endian,
+            big: false,
+        },
+        Some(43) => {
+            // BigTIFF's header carries the offset size and a reserved zero
+            // where a classic header has already started the first IFD
+            // pointer. Both are fixed by the specification; a file disagreeing
+            // about either is not one this resolver can address safely, and
+            // guessing would mean reading every subsequent offset from the
+            // wrong width.
+            match read_u16(bytes, 4, big_endian) {
+                Some(8) => {}
+                other => {
+                    return Err(CogError::NotTiff(format!(
+                        "BigTIFF offset size is {other:?}, not 8"
+                    )))
+                }
+            }
+            match read_u16(bytes, 6, big_endian) {
+                Some(0) => {}
+                other => {
+                    return Err(CogError::NotTiff(format!(
+                        "BigTIFF reserved field is {other:?}, not 0"
+                    )))
+                }
+            }
+            Tiff {
+                big_endian,
+                big: true,
+            }
+        }
+        other => {
+            return Err(CogError::NotTiff(format!(
+                "version {other:?}, not 42 or 43"
+            )))
+        }
+    };
+    let first_ifd = tiff
+        .read_offset(bytes, if tiff.big { 8 } else { 4 })
         .ok_or_else(|| CogError::NotTiff("no first IFD offset".into()))?;
 
-    let ghost = Ghost::parse(bytes, first_ifd)?;
-    let ifds = walk(bytes, big_endian, first_ifd, object_size)?;
+    let ghost = Ghost::parse(bytes, tiff.header_len(), first_ifd)?;
+    let ifds = walk(bytes, tiff, first_ifd, object_size)?;
     if ifds.is_empty() {
         return Err(CogError::NotTiff("no image file directory".into()));
     }
@@ -513,18 +550,28 @@ pub fn build_index_with_layout(
             let entry = scanned.get(&tag).ok_or_else(|| {
                 CogError::Malformed(format!("IFD at {}: no tag {tag}", raw.offset))
             })?;
+            // SHORT, LONG or LONG8. GDAL writes `TileOffsets` as LONG8 and
+            // `TileByteCounts` as LONG in the same BigTIFF, so the two arrays
+            // of one image can differ -- anything assuming a single width for
+            // both would pass on a classic TIFF and corrupt a BigTIFF.
             let width = match type_size(entry.field_type) {
                 2 => 2u8,
                 4 => 4u8,
+                8 => 8u8,
                 other => {
                     return Err(CogError::Malformed(format!(
-                        "IFD at {}: tag {tag} has {other}-byte elements, not SHORT or LONG",
+                        "IFD at {}: tag {tag} has {other}-byte elements, not SHORT, LONG or LONG8",
                         raw.offset
                     )))
                 }
             };
             Ok(TileArray {
-                at: entry.value.map_or(entry.at + 8, |(start, _)| start),
+                // An array small enough to live inside its entry starts at the
+                // entry's value field, which is four bytes further into a
+                // BigTIFF entry than a classic one.
+                at: entry
+                    .value
+                    .map_or(entry.at + tiff.value_at(), |(start, _)| start),
                 width,
                 count: entry.count,
             })
@@ -590,15 +637,16 @@ pub fn build_index_with_layout(
     }
     let full_height = images[0].height;
 
+    let header_len = tiff.header_len();
     let mut regions = vec![Region {
         start: 0,
-        len: HEADER_LEN,
+        len: header_len,
         kind: named("header"),
     }];
     if let Some(ghost) = &ghost {
         regions.push(Region {
-            start: HEADER_LEN,
-            len: ghost.end - HEADER_LEN,
+            start: header_len,
+            len: ghost.end - header_len,
             kind: named("ghost_area"),
         });
     }
@@ -913,8 +961,8 @@ impl Ghost {
     /// `Ok(None)` when the object has no ghost area, which is the normal case
     /// for a TIFF that is not a GDAL COG and must NOT be read as a declaration
     /// of a zero-length leader on a file that has one.
-    fn parse(bytes: &[u8], first_ifd: u64) -> Result<Option<Self>, CogError> {
-        let at = HEADER_LEN as usize;
+    fn parse(bytes: &[u8], header_len: u64, first_ifd: u64) -> Result<Option<Self>, CogError> {
+        let at = header_len as usize;
         if bytes.len() < at + GHOST_MARKER.len() || !bytes[at..].starts_with(GHOST_MARKER) {
             return Ok(None);
         }
@@ -932,7 +980,7 @@ impl Ghost {
             .map_err(|_| unsized_header())?
             .parse()
             .map_err(|_| unsized_header())?;
-        let start = HEADER_LEN + (GHOST_MARKER.len() + digits + GHOST_UNITS.len()) as u64;
+        let start = header_len + (GHOST_MARKER.len() + digits + GHOST_UNITS.len()) as u64;
         let end = start
             .checked_add(declared)
             .ok_or_else(|| CogError::UnsupportedGhostArea("declared size overflows".into()))?;
@@ -1012,12 +1060,7 @@ struct RawEntry {
 
 /// Every IFD reachable from `first`, along the next-IFD chain and through
 /// `SubIFDs`, in the order they were discovered.
-fn walk(
-    bytes: &[u8],
-    big_endian: bool,
-    first: u64,
-    object_size: u64,
-) -> Result<Vec<RawIfd>, CogError> {
+fn walk(bytes: &[u8], tiff: Tiff, first: u64, object_size: u64) -> Result<Vec<RawIfd>, CogError> {
     let mut queue = VecDeque::from([first]);
     let mut seen = HashSet::new();
     let mut out: Vec<RawIfd> = Vec::new();
@@ -1029,16 +1072,84 @@ fn walk(
             if out.len() >= MAX_IMAGES {
                 return Err(CogError::TooManyImages { limit: MAX_IMAGES });
             }
-            let ifd = scan_ifd(bytes, big_endian, offset, object_size)?;
+            let ifd = scan_ifd(bytes, tiff, offset, object_size)?;
             // Rule 3. Each pointer is the head of its own chain.
             if let Some(entry) = ifd.entries.iter().find(|e| e.tag == SUB_IFDS) {
-                queue.extend(entry_integers(bytes, big_endian, entry));
+                queue.extend(entry_integers(bytes, tiff, entry));
             }
             offset = ifd.next;
             out.push(ifd);
         }
     }
     Ok(out)
+}
+
+/// Which of the two TIFF layouts a file uses.
+///
+/// BigTIFF is not a different format, it is the same one with every offset and
+/// count widened to 64 bits: the header carries an offset size, an IFD counts
+/// its entries in a u64, each entry is 20 bytes rather than 12, and a value of
+/// eight bytes or fewer -- rather than four -- lives inside the entry. Tags,
+/// field types and their meanings are unchanged, which is why threading this
+/// through the scan is the whole change: nothing downstream has to know.
+///
+/// It matters far more than "files over 4 GB". Writers producing large
+/// collections pass `BIGTIFF=YES` and stop thinking about it, so real
+/// cloud-native rasters are BigTIFF at sizes well under the limit -- every file
+/// in the Wildland Almanac CONUS collection is, including the 1.6 GB ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tiff {
+    big_endian: bool,
+    /// Version 43 rather than 42.
+    big: bool,
+}
+
+impl Tiff {
+    /// Bytes per IFD entry: 12 classic, 20 big.
+    fn entry_len(self) -> u64 {
+        if self.big {
+            20
+        } else {
+            12
+        }
+    }
+
+    /// Bytes per file offset, which is also the largest value that fits inside
+    /// an entry rather than at an offset.
+    fn offset_len(self) -> u64 {
+        if self.big {
+            8
+        } else {
+            4
+        }
+    }
+
+    /// Where an entry's value-or-offset field starts, relative to the entry.
+    fn value_at(self) -> u64 {
+        if self.big {
+            12
+        } else {
+            8
+        }
+    }
+
+    /// Bytes before the first IFD pointer ends: 8 classic, 16 big. Also where
+    /// a GDAL ghost area starts, since it sits immediately after the header.
+    fn header_len(self) -> u64 {
+        if self.big {
+            BIG_HEADER_LEN
+        } else {
+            HEADER_LEN
+        }
+    }
+
+    fn read_offset(self, bytes: &[u8], at: u64) -> Option<u64> {
+        if self.big {
+            read_u64(bytes, at, self.big_endian)
+        } else {
+            read_u32(bytes, at, self.big_endian).map(u64::from)
+        }
+    }
 }
 
 /// The byte width of a TIFF field type, or zero for one this resolver does not
@@ -1053,12 +1164,7 @@ fn type_size(field_type: u16) -> u64 {
     }
 }
 
-fn scan_ifd(
-    bytes: &[u8],
-    big_endian: bool,
-    offset: u64,
-    object_size: u64,
-) -> Result<RawIfd, CogError> {
+fn scan_ifd(bytes: &[u8], tiff: Tiff, offset: u64, object_size: u64) -> Result<RawIfd, CogError> {
     // A structure past the end of the OBJECT is a lie the file told; one past
     // the end of the BUFFER is a prefix the caller cut too short. The two are
     // different answers and only the second is worth retrying.
@@ -1075,28 +1181,49 @@ fn scan_ifd(
     };
     let overflow = || CogError::Malformed(format!("IFD at {offset} overflows a u64"));
 
-    reach(offset.checked_add(2).ok_or_else(overflow)?)?;
-    let count = u64::from(read_u16(bytes, offset, big_endian).ok_or_else(overflow)?);
-    let len = 2 + count * 12 + 4; // at most 2 + 65535 * 12 + 4
+    // The entry count is a u16 classic and a u64 big, so the header the count
+    // lives in is 2 bytes or 8.
+    let count_len = if tiff.big { 8 } else { 2 };
+    reach(offset.checked_add(count_len).ok_or_else(overflow)?)?;
+    let count = if tiff.big {
+        read_u64(bytes, offset, tiff.big_endian).ok_or_else(overflow)?
+    } else {
+        u64::from(read_u16(bytes, offset, tiff.big_endian).ok_or_else(overflow)?)
+    };
+    // A classic IFD is bounded by its u16 count; a BigTIFF one is not, so a
+    // corrupt u64 could claim an IFD larger than the object. `reach` catches
+    // that below, but the multiplication has to survive long enough to be
+    // checked.
+    let len = count
+        .checked_mul(tiff.entry_len())
+        .and_then(|body| body.checked_add(count_len + tiff.offset_len()))
+        .ok_or_else(overflow)?;
     let end = offset.checked_add(len).ok_or_else(overflow)?;
     reach(end)?;
 
-    let mut entries = Vec::with_capacity(count as usize);
+    let mut entries = Vec::with_capacity(count.min(1 << 16) as usize);
     for i in 0..count {
-        let at = offset + 2 + i * 12;
-        let tag = read_u16(bytes, at, big_endian).ok_or_else(overflow)?;
-        let field_type = read_u16(bytes, at + 2, big_endian).ok_or_else(overflow)?;
-        let values = u64::from(read_u32(bytes, at + 4, big_endian).ok_or_else(overflow)?);
+        let at = offset + count_len + i * tiff.entry_len();
+        let tag = read_u16(bytes, at, tiff.big_endian).ok_or_else(overflow)?;
+        let field_type = read_u16(bytes, at + 2, tiff.big_endian).ok_or_else(overflow)?;
+        let values = if tiff.big {
+            read_u64(bytes, at + 4, tiff.big_endian).ok_or_else(overflow)?
+        } else {
+            u64::from(read_u32(bytes, at + 4, tiff.big_endian).ok_or_else(overflow)?)
+        };
         let size = type_size(field_type)
             .checked_mul(values)
             .ok_or_else(overflow)?;
-        // Four bytes or fewer live in the entry itself; a size of zero is
-        // either an empty value or a field type with no known width, and in
-        // neither case is there an extent to claim.
-        let value = if size == 0 || size <= 4 {
+        // A value fitting in the offset field lives in the entry itself --
+        // four bytes classic, eight big. A size of zero is either an empty
+        // value or a field type with no known width, and in neither case is
+        // there an extent to claim.
+        let value = if size == 0 || size <= tiff.offset_len() {
             None
         } else {
-            let start = u64::from(read_u32(bytes, at + 8, big_endian).ok_or_else(overflow)?);
+            let start = tiff
+                .read_offset(bytes, at + tiff.value_at())
+                .ok_or_else(overflow)?;
             reach(start.checked_add(size).ok_or_else(overflow)?)?;
             Some((start, size))
         };
@@ -1108,8 +1235,9 @@ fn scan_ifd(
             value,
         });
     }
-    let next =
-        u64::from(read_u32(bytes, offset + 2 + count * 12, big_endian).ok_or_else(overflow)?);
+    let next = tiff
+        .read_offset(bytes, offset + count_len + count * tiff.entry_len())
+        .ok_or_else(overflow)?;
     Ok(RawIfd {
         offset,
         len,
@@ -1121,18 +1249,23 @@ fn scan_ifd(
 /// An entry's values, read as integers. Only used for `SubIFDs`, which has to
 /// be read during the scan -- before there is a `Directory` to ask -- because
 /// it is what decides which directories exist.
-fn entry_integers(bytes: &[u8], big_endian: bool, entry: &RawEntry) -> Vec<u64> {
+fn entry_integers(bytes: &[u8], tiff: Tiff, entry: &RawEntry) -> Vec<u64> {
     let size = type_size(entry.field_type);
-    if !matches!(entry.field_type, 3 | 4 | 13) {
+    // LONG8 and IFD8 join the list for BigTIFF, where a SubIFDs pointer is a
+    // 64-bit offset.
+    if !matches!(entry.field_type, 3 | 4 | 13 | 16 | 18) {
         return Vec::new();
     }
-    let base = entry.value.map_or(entry.at + 8, |(start, _)| start);
+    let base = entry
+        .value
+        .map_or(entry.at + tiff.value_at(), |(start, _)| start);
     (0..entry.count)
         .filter_map(|i| {
             let at = base + i * size;
             match size {
-                2 => read_u16(bytes, at, big_endian).map(u64::from),
-                _ => read_u32(bytes, at, big_endian).map(u64::from),
+                2 => read_u16(bytes, at, tiff.big_endian).map(u64::from),
+                8 => read_u64(bytes, at, tiff.big_endian),
+                _ => read_u32(bytes, at, tiff.big_endian).map(u64::from),
             }
         })
         .collect()
@@ -1151,6 +1284,19 @@ fn read_u16(bytes: &[u8], at: u64, big_endian: bool) -> Option<u16> {
         u16::from_be_bytes(raw)
     } else {
         u16::from_le_bytes(raw)
+    })
+}
+
+fn read_u64(bytes: &[u8], at: u64, big_endian: bool) -> Option<u64> {
+    let raw: [u8; 8] = bytes
+        .get(usize::try_from(at).ok()?..)?
+        .get(..8)?
+        .try_into()
+        .ok()?;
+    Some(if big_endian {
+        u64::from_be_bytes(raw)
+    } else {
+        u64::from_le_bytes(raw)
     })
 }
 
@@ -1990,19 +2136,86 @@ mod tests {
         }
     }
 
-    // ---- rule 9: BigTIFF ----------------------------------------------------
+    // ---- BigTIFF ------------------------------------------------------------
 
-    // Out of scope has to mean an error rather than a partial classification:
-    // every offset in a BigTIFF is eight bytes wide, so a classic-TIFF parse of
-    // one reads halves of offsets as whole ones. Tracked as issue #6.
+    // BigTIFF is not an edge case: writers producing large collections pass
+    // `BIGTIFF=YES` and stop thinking about it, so real cloud-native rasters
+    // are version 43 at sizes well under the 4 GB that forces it. Every file in
+    // the Wildland Almanac CONUS collection is, including the 1.6 GB ones.
     #[test]
-    fn a_bigtiff_is_refused_rather_than_misparsed() {
-        let mut bytes = read("tests/fixtures/tiny-cog.tif");
-        bytes[2..4].copy_from_slice(&43u16.to_le_bytes());
-        assert!(matches!(
-            build_index(&bytes, bytes.len() as u64),
-            Err(CogError::BigTiff)
-        ));
+    fn a_bigtiff_classifies_every_byte_like_any_other_tiff() {
+        let bytes = read("tests/fixtures/bigtiff.tif");
+        assert_eq!(&bytes[2..4], &43u16.to_le_bytes(), "fixture is not BigTIFF");
+
+        let idx = index(&bytes);
+        assert_eq!(
+            idx.regions()
+                .iter()
+                .filter(|r| matches!(r.kind, RegionKind::Unmapped))
+                .count(),
+            0,
+            "a BigTIFF left bytes unclassified"
+        );
+        // Two images, and tiles at both levels.
+        let levels: std::collections::BTreeSet<u32> = tiles(&idx)
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RegionKind::Tile { overview_level, .. } => Some(*overview_level),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(levels, std::collections::BTreeSet::from([0, 1]), "levels");
+    }
+
+    // The scan reads entry LOCATIONS by hand and `tiff` reads the VALUES, and
+    // the two must agree about where the tile arrays are -- the cross-check the
+    // whole resolver rests on. Widening every offset is exactly the change that
+    // could break it silently, so assert it on a BigTIFF specifically.
+    #[test]
+    fn a_bigtiff_tile_array_is_found_at_the_same_place_the_values_come_from() {
+        let bytes = read("tests/fixtures/bigtiff.tif");
+        let (_, layout) = build_index_with_layout(&bytes, bytes.len() as u64).expect("indexes");
+
+        for image in &layout.images {
+            // GDAL writes TileOffsets as LONG8 and TileByteCounts as LONG in
+            // the same file, so the two arrays have different element widths.
+            // Anything that assumed one width for both would pass on a classic
+            // TIFF and corrupt a BigTIFF.
+            assert!(
+                matches!(image.offsets.width, 4 | 8),
+                "offsets width {}",
+                image.offsets.width
+            );
+            assert!(
+                matches!(image.byte_counts.width, 2 | 4 | 8),
+                "byte counts width {}",
+                image.byte_counts.width
+            );
+            // Every element of both arrays lies inside the object.
+            for array in [image.offsets, image.byte_counts] {
+                let end = array.at + array.count * u64::from(array.width);
+                assert!(end <= bytes.len() as u64, "array runs past the object");
+            }
+        }
+    }
+
+    // A header claiming BigTIFF but disagreeing with the specification about
+    // the offset size is refused rather than guessed at: reading every
+    // subsequent offset at the wrong width would classify confidently and
+    // wrongly.
+    #[test]
+    fn a_bigtiff_header_with_the_wrong_offset_size_is_refused() {
+        let good = read("tests/fixtures/bigtiff.tif");
+        for (at, value) in [(4u64, 4u16), (4, 16), (6, 1)] {
+            let mut bytes = good.clone();
+            let at = at as usize;
+            bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+            let result = build_index(&bytes, bytes.len() as u64);
+            assert!(
+                matches!(result, Err(CogError::NotTiff(_))),
+                "offset {at} = {value}: {result:?}"
+            );
+        }
     }
 
     // ---- the invariant that closes the unmapped-range bypass ----------------
